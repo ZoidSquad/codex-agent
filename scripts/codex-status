@@ -1,0 +1,195 @@
+#!/bin/bash
+#
+# codex-status: Check Codex session status and view output
+# Usage: codex-status --project <name> [options]
+#
+
+set -e
+
+# Agent identity - hardcoded for Bender
+AGENT_NAME="Bender"
+
+# Code lives in zoidcode (shared across all agents)
+CODE_BASE="/home/dan/zoidcode"
+
+# Session tracking is per-agent (in Bender's workspace memory)
+MEMORY_DIR="$HOME/.openclaw/workspace-bender/memory"
+SESSIONS_FILE="$MEMORY_DIR/codex-sessions.json"
+
+# Defaults
+PROJECT=""
+SHOW_OUTPUT=false
+FOLLOW=false
+KILL=false
+LIMIT=50
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --output|-o)
+      SHOW_OUTPUT=true
+      shift
+      ;;
+    --follow|-f)
+      SHOW_OUTPUT=true
+      FOLLOW=true
+      shift
+      ;;
+    --kill|-k)
+      KILL=true
+      shift
+      ;;
+    --limit|-n)
+      LIMIT="$2"
+      shift 2
+      ;;
+    --help|-h)
+      echo "Usage: codex-status --project <name> [options]"
+      echo ""
+      echo "Options:"
+      echo "  --project <name>   Project name (required)"
+      echo "  --output, -o       Show session output"
+      echo "  --follow, -f       Follow output (like tail -f)"
+      echo "  --kill, -k         Kill running session"
+      echo "  --limit <n>, -n    Limit output to N lines (default: 50)"
+      echo "  --help, -h         Show this help"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Validate
+if [[ -z "$PROJECT" ]]; then
+  echo "Error: --project is required" >&2
+  exit 1
+fi
+
+# Normalize project name: extract basename if full path given
+PROJECT=$(basename "$PROJECT")
+
+# Setup paths
+PROJECT_DIR="$CODE_BASE/$PROJECT"
+ZOID_DIR="$PROJECT_DIR/.zoid"
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+SESSION_TRACKER="$ZOID_DIR/session.json"
+
+# Check if project exists
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "Error: Project not found: $PROJECT" >&2
+  echo "Expected: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+# Kill mode
+if [[ "$KILL" == true ]]; then
+  # Find codex processes for this project
+  PIDS=$(pgrep -f "codex.*$PROJECT" || echo "")
+  
+  if [[ -n "$PIDS" ]]; then
+    echo "Killing Codex processes for $PROJECT:"
+    echo "$PIDS" | while read pid; do
+      echo "  - $pid"
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    # Force kill if still running
+    echo "$PIDS" | while read pid; do
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    done
+    echo "Session killed."
+  else
+    echo "No running Codex processes found for $PROJECT"
+  fi
+  
+  # Update tracker if exists
+  if [[ -f "$SESSION_TRACKER" ]]; then
+    jq '.status = "killed" | .killed_at = "'$(date -Iseconds)'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER" 2>/dev/null || true
+  fi
+  
+  exit 0
+fi
+
+# Show status header
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Codex Status: $PROJECT"
+echo "═══════════════════════════════════════════════════════════════"
+
+# Load tracker info
+if [[ -f "$SESSION_TRACKER" ]]; then
+  STATUS=$(jq -r '.status // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  SESSION_ID=$(jq -r '.session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  STARTED=$(jq -r '.started_at // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  COMPLETED=$(jq -r '.completed_at // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
+  
+  echo "  Session ID: $SESSION_ID"
+  echo "  Status: $STATUS"
+  echo "  Started: $STARTED"
+  [[ "$COMPLETED" != "N/A" ]] && echo "  Completed: $COMPLETED"
+else
+  echo "  No session tracker found"
+  STATUS="unknown"
+fi
+
+# Check for running processes
+RUNNING_PIDS=$(pgrep -f "codex.*$PROJECT" || echo "")
+if [[ -n "$RUNNING_PIDS" ]]; then
+  echo "  Process: running (PIDs: $(echo $RUNNING_PIDS | tr '\n' ' '))"
+  # If status says completed but process is running, update
+  if [[ "$STATUS" == "completed" || "$STATUS" == "unknown" ]]; then
+    STATUS="running"
+  fi
+else
+  echo "  Process: not running"
+fi
+
+# Show project info
+echo "  Directory: $PROJECT_DIR"
+echo "  Git repo: $([[ -d "$PROJECT_DIR/.git" ]] && echo "yes" || echo "no")"
+
+# Show recent git activity if git repo
+if [[ -d "$PROJECT_DIR/.git" ]]; then
+  cd "$PROJECT_DIR"
+  LAST_COMMIT=$(git log -1 --format="%h %s" 2>/dev/null || echo "none")
+  echo "  Last commit: $LAST_COMMIT"
+fi
+
+echo "═══════════════════════════════════════════════════════════════"
+
+# Show output if requested
+if [[ "$SHOW_OUTPUT" == true ]]; then
+  if [[ ! -f "$OUTPUT_FILE" ]]; then
+    echo ""
+    echo "No output file found."
+    exit 0
+  fi
+  
+  echo ""
+  echo "--- Output ($([[ "$FOLLOW" == true ]] && echo "following" || echo "last $LIMIT lines")) ---"
+  echo ""
+  
+  if [[ "$FOLLOW" == true ]]; then
+    tail -f "$OUTPUT_FILE"
+  else
+    tail -n "$LIMIT" "$OUTPUT_FILE"
+  fi
+fi
+
+# Show hint if no output requested
+if [[ "$SHOW_OUTPUT" == false && "$KILL" == false ]]; then
+  echo ""
+  echo "Commands:"
+  echo "  codex-status --project $PROJECT --output     # View output"
+  echo "  codex-status --project $PROJECT --follow     # Follow live"
+  [[ "$STATUS" == "running" ]] && echo "  codex-status --project $PROJECT --kill       # Kill session"
+  echo ""
+fi

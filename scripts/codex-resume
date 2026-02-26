@@ -1,0 +1,157 @@
+#!/bin/bash
+#
+# codex-resume: Resume a previous Codex session
+# Usage: codex-resume --project <name> "additional instructions"
+#
+
+set -e
+
+# Agent identity - hardcoded for Bender
+AGENT_NAME="Bender"
+
+# Code lives in zoidcode (shared across all agents)
+CODE_BASE="/home/dan/zoidcode"
+
+# Session tracking is per-agent (in Bender's workspace memory)
+MEMORY_DIR="$HOME/.openclaw/workspace-bender/memory"
+SESSIONS_FILE="$MEMORY_DIR/codex-sessions.json"
+
+# Defaults
+PROJECT=""
+PROMPT=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --help|-h)
+      echo "Usage: codex-resume --project <name> \"additional instructions\""
+      echo ""
+      echo "Resumes the last Codex session for the specified project."
+      echo "If no additional instructions provided, asks Codex to continue."
+      exit 0
+      ;;
+    *)
+      PROMPT="$*"
+      break
+      ;;
+  esac
+done
+
+# Validate
+if [[ -z "$PROJECT" ]]; then
+  echo "Error: --project is required" >&2
+  exit 1
+fi
+
+# Normalize project name: extract basename if full path given
+PROJECT=$(basename "$PROJECT")
+
+# Default prompt if none provided
+if [[ -z "$PROMPT" ]]; then
+  PROMPT="Continue from where you left off. Complete the previous task."
+fi
+
+# Check sessions file exists
+if [[ ! -f "$SESSIONS_FILE" ]]; then
+  echo "Error: No sessions found. Use 'codex-do' first." >&2
+  exit 1
+fi
+
+# Get session ID from registry
+SESSION_ID=$(jq -r ".[$PROJECT].current_session // empty" "$SESSIONS_FILE" 2>/dev/null || echo "")
+
+if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
+  echo "Error: No session found for project '$PROJECT'" >&2
+  echo "Available projects:" >&2
+  jq -r 'keys[]' "$SESSIONS_FILE" >&2
+  exit 1
+fi
+
+# Setup paths
+PROJECT_DIR="$CODE_BASE/$PROJECT"
+ZOID_DIR="$PROJECT_DIR/.zoid"
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "Error: Project directory not found: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+# Check for codex CLI
+if ! command -v codex &> /dev/null; then
+  echo "Error: codex CLI not found" >&2
+  exit 1
+fi
+
+# Show info
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Codex Resume: $AGENT_NAME"
+echo "  Project: $PROJECT"
+echo "  Session: $SESSION_ID"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Additional instructions:"
+echo "  $PROMPT"
+echo ""
+
+# Create iteration tracker
+ITERATION_FILE="$ZOID_DIR/iteration_$(date +%s).json"
+cat > "$ITERATION_FILE" << EOF
+{
+  "type": "resume",
+  "session_id": "$SESSION_ID",
+  "timestamp": "$(date -Iseconds)",
+  "prompt": $(echo "$PROMPT" | jq -R -s .)
+}
+EOF
+
+# Run codex resume
+cd "$PROJECT_DIR"
+
+echo "Resuming session..."
+echo ""
+
+# Run with JSON output and capture
+if codex exec --dangerously-bypass-approvals-and-sandbox --json -o "$OUTPUT_FILE" resume "$SESSION_ID" "$PROMPT"; then
+  EXIT_CODE=$?
+  STATUS="completed"
+else
+  EXIT_CODE=$?
+  STATUS="failed"
+fi
+
+# Update session tracker
+SESSION_TRACKER="$ZOID_DIR/session.json"
+if [[ -f "$SESSION_TRACKER" ]]; then
+  jq --arg status "$STATUS" --arg time "$(date -Iseconds)" '.status = $status | .last_resume = $time' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+fi
+
+# Log skill usage to Mission Control
+if [[ $EXIT_CODE -eq 0 ]]; then
+  # Truncate prompt for logging
+  short_prompt=$(echo "$PROMPT" | cut -c1-80)
+  if [[ ${#PROMPT} -gt 80 ]]; then
+    short_prompt="${short_prompt}..."
+  fi
+  # Log via clawd CLI using 'skill used' for proper action type (suppress errors - don't break main flow)
+  /usr/bin/env node ~/clawd-team/clawd-cli.js skill used "codex-agent" "Resume project: $PROJECT - $short_prompt" 2>/dev/null || true
+fi
+
+# Show summary
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Resume Result"
+echo "═══════════════════════════════════════════════════════════════"
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo "  Status: ✅ Completed"
+else
+  echo "  Status: ❌ Failed (exit code $EXIT_CODE)"
+fi
+echo "  Output: $OUTPUT_FILE"
+echo "═══════════════════════════════════════════════════════════════"
+
+exit $EXIT_CODE
