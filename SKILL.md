@@ -53,6 +53,7 @@ codex-do --project <folder_name> [options] "Your prompt here"
 - `--yolo` - Skip sandbox, auto-approve all changes (dangerous!)
 - `--full-auto` - Auto-approve within workspace (safer than --yolo)
 - `--dry-run` - Show what would execute, don't run
+- `--suggest-cmd` - Output OpenClaw exec command for PTY/background mode
 - `--timeout <minutes>` - Kill after N minutes (default: 30)
 
 **What it does automatically:**
@@ -79,11 +80,14 @@ codex-resume --project <folder_name> "Additional instructions"
 Check session status and view output.
 
 ```bash
-# Check status
+# Check status (detects OpenClaw background sessions automatically)
 codex-status --project <folder_name>
 
 # View output
 codex-status --project <folder_name> --output
+
+# Follow live output (like tail -f)
+codex-status --project <folder_name> --output --follow
 
 # Kill stuck session
 codex-status --project <folder_name> --kill
@@ -254,6 +258,57 @@ chmod +x ~/clawd-team/agents/{you}/skills/codex-agent/scripts/*
 ```
 
 ## Advanced Usage
+
+### PTY Mode and Background Execution
+
+Codex is an interactive terminal application. For best results, use PTY mode when calling codex-do:
+
+```bash
+# Use PTY for proper terminal interaction
+exec pty:true command:"codex-do --project foo 'Build feature'"
+```
+
+### Background Mode with OpenClaw Process Tracking
+
+For long-running tasks, use OpenClaw's background mode for better monitoring:
+
+**Option 1: Use --suggest-cmd to get the command**
+```bash
+# Get the proper OpenClaw exec command
+codex-do --project foo --suggest-cmd --full-auto "Build feature"
+# Copy the output and run it
+```
+
+**Option 2: Manual background execution**
+```bash
+# Start with PTY and background mode
+exec pty:true background:true workdir:/home/dan/zoidcode/<project> \\
+  command:"codex exec --full-auto -o .zoid/output.txt 'Your task'"
+# Returns: sessionId: xxx
+
+# Store the sessionId for tracking
+echo '{"openclaw_session_id":"SESSION_ID_HERE"}' > \\
+  /home/dan/zoidcode/<project>/.zoid/openclaw-session.json
+```
+
+**Monitor with OpenClaw process tool:**
+```bash
+# Check if running
+process action:poll sessionId:xxx
+
+# View output
+process action:log sessionId:xxx
+
+# Kill if needed
+process action:kill sessionId:xxx
+```
+
+**Check status (detects OpenClaw sessions automatically):**
+```bash
+codex-status --project foo
+# Shows OpenClaw session ID if detected
+# Suggests process tool commands
+```
 
 ### Multi-Project Sessions
 

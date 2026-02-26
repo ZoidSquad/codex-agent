@@ -80,6 +80,7 @@ PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
 OUTPUT_FILE="$ZOID_DIR/output.txt"
 SESSION_TRACKER="$ZOID_DIR/session.json"
+OPENCLAW_SESSION_FILE="$ZOID_DIR/openclaw-session.json"
 
 # Check if project exists
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -140,7 +141,16 @@ else
   STATUS="unknown"
 fi
 
-# Check for running processes
+# Check for OpenClaw background session
+OPENCLAW_SESSION_ID=""
+if [[ -f "$OPENCLAW_SESSION_FILE" ]]; then
+  OPENCLAW_SESSION_ID=$(jq -r '.openclaw_session_id // empty' "$OPENCLAW_SESSION_FILE" 2>/dev/null || echo "")
+  if [[ -n "$OPENCLAW_SESSION_ID" ]]; then
+    echo "  OpenClaw Session: $OPENCLAW_SESSION_ID"
+  fi
+fi
+
+# Check for running processes (both direct and OpenClaw-managed)
 RUNNING_PIDS=$(pgrep -f "codex.*$PROJECT" || echo "")
 if [[ -n "$RUNNING_PIDS" ]]; then
   echo "  Process: running (PIDs: $(echo $RUNNING_PIDS | tr '\n' ' '))"
@@ -187,9 +197,16 @@ fi
 # Show hint if no output requested
 if [[ "$SHOW_OUTPUT" == false && "$KILL" == false ]]; then
   echo ""
-  echo "Commands:"
+  if [[ -n "$OPENCLAW_SESSION_ID" && "$STATUS" == "running" ]]; then
+    echo "OpenClaw Process Commands:"
+    echo "  process action:poll sessionId:$OPENCLAW_SESSION_ID    # Check if running"
+    echo "  process action:log sessionId:$OPENCLAW_SESSION_ID     # View output"
+    echo "  process action:kill sessionId:$OPENCLAW_SESSION_ID    # Kill session"
+    echo ""
+  fi
+  echo "Traditional Commands:"
   echo "  codex-status --project $PROJECT --output     # View output"
   echo "  codex-status --project $PROJECT --follow     # Follow live"
-  [[ "$STATUS" == "running" ]] && echo "  codex-status --project $PROJECT --kill       # Kill session"
+  [[ "$STATUS" == "running" ]] && echo "  codex-status --project $PROJECT --kill       # Kill session (traditional)"
   echo ""
 fi

@@ -21,6 +21,7 @@ PROJECT=""
 YOLO=false
 FULL_AUTO=false
 DRY_RUN=false
+SUGGEST_CMD=false
 TIMEOUT=30
 PROMPT=""
 
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
+    --suggest-cmd)
+      SUGGEST_CMD=true
+      shift
+      ;;
     --timeout)
       TIMEOUT="$2"
       shift 2
@@ -55,6 +60,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --yolo            Skip sandbox, auto-approve (dangerous!)"
       echo "  --full-auto       Auto-approve within workspace"
       echo "  --dry-run         Show what would execute"
+      echo "  --suggest-cmd     Output OpenClaw exec command for background mode"
       echo "  --timeout <min>   Kill after N minutes (default: 30)"
       echo "  --help            Show this help"
       exit 0
@@ -81,6 +87,38 @@ fi
 # Normalize project name: extract basename if full path given
 # /home/dan/zoidcode/mission_control_ui -> mission_control_ui
 PROJECT=$(basename "$PROJECT")
+
+# Handle --suggest-cmd mode (output OpenClaw exec command)
+if [[ "$SUGGEST_CMD" == true ]]; then
+  # Build codex flags
+  SUGGEST_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
+  if [[ "$YOLO" == true ]]; then
+    SUGGEST_FLAGS="$SUGGEST_FLAGS --yolo"
+  elif [[ "$FULL_AUTO" == true ]]; then
+    SUGGEST_FLAGS="$SUGGEST_FLAGS --full-auto"
+  fi
+  SUGGEST_FLAGS="$SUGGEST_FLAGS --json"
+  
+  PROJECT_DIR="$CODE_BASE/$PROJECT"
+  
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  OpenClaw Exec Command (for background mode with PTY)"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+  echo "Run this to start Codex with PTY and background mode:"
+  echo ""
+  echo "exec pty:true background:true workdir:$PROJECT_DIR \\"
+  echo "  command:\"codex $SUGGEST_FLAGS -o .zoid/output.txt \\"
+  echo "    $(echo "$PROMPT" | jq -R -s . | sed 's/\\"/\\\\\\"/g')\""
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+  echo "After running, store the sessionId:"
+  echo "  echo '{\"openclaw_session_id\":\"SESSION_ID_HERE\"}' > \\"
+  echo "    $PROJECT_DIR/.zoid/openclaw-session.json"
+  echo ""
+  exit 0
+fi
 
 # Setup paths
 PROJECT_DIR="$CODE_BASE/$PROJECT"
