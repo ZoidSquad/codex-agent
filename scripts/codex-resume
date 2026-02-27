@@ -11,15 +11,37 @@ set -o pipefail
 # CONFIGURATION & DETECTION
 # ============================================================================
 
-# Detect agent identity
+# Detect agent identity from environment or SOUL.md
+# Priority: AGENT_NAME env var > OPENCLAW_WORKSPACE/SOUL.md > workspace/SOUL.md > fallback
 if [[ -n "$AGENT_NAME" ]]; then
   DETECTED_AGENT="$AGENT_NAME"
-elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
-  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
-elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
-  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace-bender/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
 else
-  DETECTED_AGENT="Unknown"
+  # Try to find SOUL.md and extract agent name
+  SOUL_FILE=""
+  if [[ -n "$OPENCLAW_WORKSPACE" && -f "$OPENCLAW_WORKSPACE/SOUL.md" ]]; then
+    SOUL_FILE="$OPENCLAW_WORKSPACE/SOUL.md"
+  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
+  elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
+    SOUL_FILE="$HOME/.openclaw/workspace-bender/SOUL.md"
+  fi
+  
+  if [[ -n "$SOUL_FILE" ]]; then
+    RAW_NAME=$(grep -E "^# SOUL\.md - " "$SOUL_FILE" 2>/dev/null | head -1 | sed 's/^# SOUL\.md - //')
+    
+    # Check for generic/template titles first
+    NORMALIZED=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]')
+    if [[ "$NORMALIZED" =~ ^(who you are|who i am|about me|my identity|template|example) ]]; then
+      DETECTED_AGENT="Agent"
+    elif [[ -n "$RAW_NAME" ]]; then
+      # Extract first word as agent name
+      DETECTED_AGENT=$(echo "$RAW_NAME" | sed 's/ (.*//' | awk '{print $1}')
+    else
+      DETECTED_AGENT="Agent"
+    fi
+  else
+    DETECTED_AGENT="Agent"
+  fi
 fi
 
 AGENT_NAME="${DETECTED_AGENT:-Agent}"
