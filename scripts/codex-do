@@ -219,11 +219,12 @@ validate_project_in_mc
 # ============================================================================
 
 if [[ "$SUGGEST_CMD" == true ]]; then
-  SUGGEST_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
+  # Build flags
+  SUGGEST_FLAGS="exec"
   if [[ "$YOLO" == true ]]; then
-    SUGGEST_FLAGS="$SUGGEST_FLAGS --yolo"
-  elif [[ "$FULL_AUTO" == true ]]; then
-    SUGGEST_FLAGS="$SUGGEST_FLAGS --full-auto"
+    SUGGEST_FLAGS="$SUGGEST_FLAGS --dangerously-bypass-approvals-and-sandbox"
+  else
+    SUGGEST_FLAGS="$SUGGEST_FLAGS -a never --sandbox workspace-write"
   fi
   SUGGEST_FLAGS="$SUGGEST_FLAGS --json"
   
@@ -469,11 +470,13 @@ log_skill_action() {
 # ============================================================================
 
 # Build codex flags
-CODEX_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
+CODEX_FLAGS="exec"
 if [[ "$YOLO" == true ]]; then
-  CODEX_FLAGS="$CODEX_FLAGS --yolo"
-elif [[ "$FULL_AUTO" == true ]]; then
-  CODEX_FLAGS="$CODEX_FLAGS --full-auto"
+  # YOLO mode: no sandbox, no approvals (dangerous)
+  CODEX_FLAGS="$CODEX_FLAGS --dangerously-bypass-approvals-and-sandbox"
+else
+  # Default: auto-execute within workspace sandbox, never prompt for approval
+  CODEX_FLAGS="$CODEX_FLAGS -a never --sandbox workspace-write"
 fi
 CODEX_FLAGS="$CODEX_FLAGS --json"
 CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
@@ -502,16 +505,14 @@ cat > "$SESSION_TRACKER" << EOF
   "prompt": $(echo "$PROMPT" | jq -R -s .),
   "status": "running",
   "flags": {
-    "yolo": $YOLO,
-    "full_auto": $FULL_AUTO
+    "yolo": $YOLO
   }
 }
 EOF
 
 # Show what we're doing
-MODE_LABEL="Sandbox"
+MODE_LABEL="Auto (workspace sandbox)"
 [[ "$YOLO" == true ]] && MODE_LABEL="YOLO (no sandbox)"
-[[ "$FULL_AUTO" == true ]] && MODE_LABEL="Full Auto"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Agent: $AGENT_NAME"
