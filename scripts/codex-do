@@ -219,12 +219,12 @@ validate_project_in_mc
 # ============================================================================
 
 if [[ "$SUGGEST_CMD" == true ]]; then
-  # Build flags
+  # Build flags - -a never goes BEFORE exec
   SUGGEST_FLAGS="exec"
   if [[ "$YOLO" == true ]]; then
-    SUGGEST_FLAGS="$SUGGEST_FLAGS --dangerously-bypass-approvals-and-sandbox"
+    SUGGEST_FLAGS="-a never $SUGGEST_FLAGS --dangerously-bypass-approvals-and-sandbox"
   else
-    SUGGEST_FLAGS="$SUGGEST_FLAGS -a never --sandbox workspace-write"
+    SUGGEST_FLAGS="-a never $SUGGEST_FLAGS --sandbox workspace-write"
   fi
   SUGGEST_FLAGS="$SUGGEST_FLAGS --json"
   
@@ -470,13 +470,14 @@ log_skill_action() {
 # ============================================================================
 
 # Build codex flags
+# NOTE: -a never goes BEFORE exec, not after
 CODEX_FLAGS="exec"
 if [[ "$YOLO" == true ]]; then
   # YOLO mode: no sandbox, no approvals (dangerous)
-  CODEX_FLAGS="$CODEX_FLAGS --dangerously-bypass-approvals-and-sandbox"
+  CODEX_FLAGS="-a never $CODEX_FLAGS --dangerously-bypass-approvals-and-sandbox"
 else
-  # Default: auto-execute within workspace sandbox, never prompt for approval
-  CODEX_FLAGS="$CODEX_FLAGS -a never --sandbox workspace-write"
+  # Default: auto-approve, sandboxed to workspace
+  CODEX_FLAGS="-a never $CODEX_FLAGS --sandbox workspace-write"
 fi
 CODEX_FLAGS="$CODEX_FLAGS --json"
 CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
@@ -511,7 +512,7 @@ cat > "$SESSION_TRACKER" << EOF
 EOF
 
 # Show what we're doing
-MODE_LABEL="Auto (workspace sandbox)"
+MODE_LABEL="Auto (sandboxed)"
 [[ "$YOLO" == true ]] && MODE_LABEL="YOLO (no sandbox)"
 
 echo "═══════════════════════════════════════════════════════════════"
