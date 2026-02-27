@@ -4,13 +4,26 @@ description: |
   Automated Codex CLI integration for software development tasks.
   Use when you need to write, modify, or review code in a project.
   Handles session tracking, git setup, output capture, and resume automatically.
+  Production-hardened with file locking, output rotation, and iteration history.
   Trigger phrases: "build a feature", "implement", "code", "develop", "create app",
   "add component", "fix bug", "refactor", "write tests".
 ---
 
-# Codex Agent Skill
+# Codex Agent Skill v2.0
 
 Automated Codex CLI wrapper with session tracking. All code lives in `/home/dan/zoidcode/`, shared across agents.
+
+## What's New in v2.0
+
+- ✅ **Dynamic agent detection** - No more hardcoded "Bender"
+- ✅ **File locking** - Prevents race conditions during concurrent sessions
+- ✅ **Output rotation** - Preserves history (output.txt, output-1.txt, output-2.txt...)
+- ✅ **Iteration history** - Full log of all work sessions per project
+- ✅ **Mission Control validation** - Ensures project exists before working
+- ✅ **Fixed exit codes** - Correctly reports Codex failure/success
+- ✅ **Fixed CLI path** - Uses `clawd` instead of old `~/clawd-team/` path
+- ✅ **Configurable timeout** - Use `--timeout 0` for no timeout
+- ✅ **Dependency checks** - Validates jq, codex, clawd are available
 
 ## Quick Start
 
@@ -20,6 +33,9 @@ codex-do --project mission_control_ui "Build a React kanban board"
 
 # Check progress
 codex-status --project mission_control_ui
+
+# View iteration history
+codex-status --project mission_control_ui --history
 
 # Continue working
 codex-resume --project mission_control_ui "Add dark mode toggle"
@@ -54,33 +70,47 @@ codex-do --project <folder_name> [options] "Your prompt here"
 - `--full-auto` - Auto-approve within workspace (safer than --yolo)
 - `--dry-run` - Show what would execute, don't run
 - `--suggest-cmd` - Output OpenClaw exec command for PTY/background mode
-- `--timeout <minutes>` - Kill after N minutes (default: 30)
+- `--no-validate` - Skip Mission Control project validation
+- `--timeout <minutes>` - Kill after N minutes (0 = no timeout, default: 30)
+
+**Environment Variables:**
+- `AGENT_NAME` - Override detected agent name
+- `OPENCLAW_WORKSPACE` - Override workspace directory
 
 **What it does automatically:**
-1. Checks for project in `/home/dan/zoidcode/<folder>/`
-2. Creates folder if missing (with git init)
-3. Creates `.zoid/` directory with session tracking
-4. Loads previous session context if resuming
-5. Runs Codex with proper flags
-6. Captures output to `.zoid/output.txt`
-7. Updates `codex-sessions.json` registry
+1. Validates project exists in Mission Control (unless `--no-validate`)
+2. Checks for project in `/home/dan/zoidcode/<folder>/`
+3. Creates folder if missing (with git init)
+4. Rotates output files (preserves history)
+5. Creates `.zoid/` directory with session tracking
+6. Runs Codex with proper flags
+7. Captures output to `.zoid/output.txt`
+8. Updates session registry with file locking
+9. Logs iteration history
+10. Reports to Mission Control
 
 ### codex-resume
 
 Continue a previous session.
 
 ```bash
-codex-resume --project <folder_name> "Additional instructions"
+codex-resume --project <folder_name> [options] "Additional instructions"
 ```
 
-**Auto-finds** the last session ID from registry and continues.
+**Options:**
+- `--project <name>` - Project name (required)
+- `--yolo` - Skip sandbox, auto-approve
+- `--full-auto` - Auto-approve within workspace (default)
+- `--sandbox` - Use sandbox mode (asks for approval)
+
+**Auto-finds** the last session ID from registry and continues with output rotation.
 
 ### codex-status
 
 Check session status and view output.
 
 ```bash
-# Check status (detects OpenClaw background sessions automatically)
+# Check status
 codex-status --project <folder_name>
 
 # View output
@@ -88,6 +118,9 @@ codex-status --project <folder_name> --output
 
 # Follow live output (like tail -f)
 codex-status --project <folder_name> --output --follow
+
+# View iteration history
+codex-status --project <folder_name> --history
 
 # Kill stuck session
 codex-status --project <folder_name> --kill
@@ -104,7 +137,7 @@ All agents work on the same codebase in zoidcode. Each agent tracks their own Co
 **How to find the folder name:**
 ```bash
 # Run this to see all projects
-~/clawd-team/clawd project list
+clawd project list
 
 # Output looks like:
 # 📁 2 project(s):
@@ -144,22 +177,35 @@ codex-do --project mission_control_ui "Build the UI"
 
 ### 3. Monitoring Progress
 
-Codex runs in background. Check status:
+Check status:
 ```bash
-# Quick status
+# Quick status (shows all output files)
 codex-status --project mission_control_ui
+
+# View iteration history
+codex-status --project mission_control_ui --history
 
 # Watch live output (like tail -f)
 codex-status --project mission_control_ui --output --follow
 ```
 
-### 4. Handling Questions
+### 4. Output File Rotation
+
+Output files are automatically rotated:
+- `output.txt` - Current/most recent
+- `output-1.txt` - Previous session
+- `output-2.txt` - Two sessions ago
+- ...up to `output-10.txt`
+
+This preserves history without manual cleanup.
+
+### 5. Handling Questions
 
 If Codex asks questions mid-session:
 1. Check output: `codex-status --project X --output`
 2. Answer via resume: `codex-resume --project X "Answer: yes"`
 
-### 5. Completion
+### 6. Completion
 
 When Codex finishes:
 1. Review `.zoid/output.txt` for summary
@@ -174,8 +220,6 @@ git diff
 git add .
 git commit -m "feat: add TaskCard component with priority badges"
 ```
-
-(GitHub remote setup will come later - for now, commits are local.)
 
 ## Safety Rules
 
@@ -201,22 +245,54 @@ Start safe, escalate only when needed:
 - ✅ Use specific, scoped prompts
 - ✅ Kill stuck sessions promptly
 
-## Session Registry
+## Session Management
+
+### Session Registry
 
 Sessions are tracked per-agent in:
 ```
-~/clawd-team/agents/{you}/memory/codex-sessions.json
+~/.openclaw/workspace/memory/codex-sessions.json
 ```
 
-**Auto-maintained fields:**
+**Fields:**
 - `current_session` - Active session ID
-- `iterations[]` - History of all sessions
-- `status` - running/completed/failed
-- `output_file` - Path to full output
+- `last_updated` - Timestamp of last activity
+- `tracker` - Full session details
 
-**Why per-agent?** Multiple agents can work on the same project simultaneously, each tracking their own Codex sessions.
+**Automatic cleanup:** Keeps last 50 projects to prevent file bloat.
+
+### Iteration History
+
+Full history of all work sessions:
+```
+~/.openclaw/workspace/memory/codex-iterations.json
+```
+
+View with: `codex-status --project <name> --history`
+
+**Automatic cleanup:** Keeps last 100 iterations per project, 1000 total.
+
+### File Locking
+
+Session registry updates use `flock` to prevent race conditions when multiple sessions run concurrently.
 
 ## Troubleshooting
+
+### "jq is required but not installed"
+
+Install jq:
+```bash
+sudo apt-get install jq
+```
+
+### "Project not found in Mission Control"
+
+Run to see available projects:
+```bash
+clawd project list
+```
+
+Or use `--no-validate` to skip validation (not recommended).
 
 ### "Not a git repository"
 
@@ -226,12 +302,13 @@ Skill auto-inits git. The repo is local for now - no remote setup needed yet.
 
 Registry may be corrupted. Check:
 ```bash
-cat ~/clawd-team/agents/{you}/memory/codex-sessions.json
+cat ~/.openclaw/workspace/memory/codex-sessions.json
 ```
 
 Or start fresh:
 ```bash
-rm ~/clawd-team/agents/{you}/memory/codex-sessions.json
+rm ~/.openclaw/workspace/memory/codex-sessions.json
+rm ~/.openclaw/workspace/memory/codex-iterations.json
 codex-do --project <folder_name> "Start fresh"
 ```
 
@@ -247,21 +324,25 @@ codex-resume --project <folder_name> "Continue from where you left off"
 
 Full output always saved to:
 ```bash
+# Current session
 cat /home/dan/zoidcode/<folder_name>/.zoid/output.txt
+
+# Previous sessions
+cat /home/dan/zoidcode/<folder_name>/.zoid/output-1.txt
 ```
 
 ### Permission errors
 
 Ensure scripts are executable:
 ```bash
-chmod +x ~/clawd-team/agents/{you}/skills/codex-agent/scripts/*
+chmod +x ~/.openclaw/workspace/skills/codex-agent/scripts/*
 ```
 
 ## Advanced Usage
 
 ### PTY Mode and Background Execution
 
-Codex is an interactive terminal application. For best results, use PTY mode when calling codex-do:
+Codex is an interactive terminal application. For best results, use PTY mode:
 
 ```bash
 # Use PTY for proper terminal interaction
@@ -270,7 +351,7 @@ exec pty:true command:"codex-do --project foo 'Build feature'"
 
 ### Background Mode with OpenClaw Process Tracking
 
-For long-running tasks, use OpenClaw's background mode for better monitoring:
+For long-running tasks, use OpenClaw's background mode:
 
 **Option 1: Use --suggest-cmd to get the command**
 ```bash
@@ -293,21 +374,16 @@ echo '{"openclaw_session_id":"SESSION_ID_HERE"}' > \\
 
 **Monitor with OpenClaw process tool:**
 ```bash
-# Check if running
 process action:poll sessionId:xxx
-
-# View output
 process action:log sessionId:xxx
-
-# Kill if needed
 process action:kill sessionId:xxx
 ```
 
-**Check status (detects OpenClaw sessions automatically):**
+### No Timeout for Long Tasks
+
 ```bash
-codex-status --project foo
-# Shows OpenClaw session ID if detected
-# Suggests process tool commands
+# Disable timeout (useful for migrations, data processing)
+codex-do --project big_migration --timeout 0 "Process all records"
 ```
 
 ### Multi-Project Sessions
@@ -323,9 +399,9 @@ codex-do --project frontend "Build UI for new endpoint"
 
 ### Multi-Agent on Same Project
 
-Bender and another agent can both work on `mission_control_ui`:
+Multiple agents can work on `mission_control_ui`:
 - Code is in one place: `/home/dan/zoidcode/mission_control_ui/`
-- Each agent has their own session tracking
+- Each agent has their own session tracking (file locking prevents conflicts)
 - Git handles coordination (commit/pull/push)
 
 ### Project Templates
@@ -338,6 +414,19 @@ codex-do --project new_app "Create a React + TypeScript app with:
 - React Router
 - Folder structure: src/components, src/pages, src/hooks"
 ```
+
+## Configuration
+
+### Environment Variables
+
+- `AGENT_NAME` - Override the detected agent name
+- `OPENCLAW_WORKSPACE` - Override the workspace directory path
+
+### File Locations
+
+- Sessions: `~/.openclaw/workspace/memory/codex-sessions.json`
+- Iterations: `~/.openclaw/workspace/memory/codex-iterations.json`
+- Output: `/home/dan/zoidcode/<project>/.zoid/output.txt`
 
 ## References
 

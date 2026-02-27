@@ -6,24 +6,51 @@
 
 set -e
 
-# Agent identity - hardcoded for Bender
-AGENT_NAME="Bender"
+# ============================================================================
+# CONFIGURATION & DETECTION
+# ============================================================================
 
-# Code lives in zoidcode (shared across all agents)
+# Detect agent identity
+if [[ -n "$AGENT_NAME" ]]; then
+  DETECTED_AGENT="$AGENT_NAME"
+elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace-bender/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+else
+  DETECTED_AGENT="Unknown"
+fi
+
+AGENT_NAME="${DETECTED_AGENT:-Agent}"
+
 CODE_BASE="/home/dan/zoidcode"
 
-# Session tracking is per-agent (in Bender's workspace memory)
-MEMORY_DIR="$HOME/.openclaw/workspace-bender/memory"
-SESSIONS_FILE="$MEMORY_DIR/codex-sessions.json"
+# Detect workspace
+if [[ -n "$OPENCLAW_WORKSPACE" ]]; then
+  WORKSPACE_DIR="$OPENCLAW_WORKSPACE"
+elif [[ -d "$HOME/.openclaw/workspace-bender" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace-bender"
+elif [[ -d "$HOME/.openclaw/workspace" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+else
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+fi
+
+MEMORY_DIR="$WORKSPACE_DIR/memory"
+ITERATIONS_FILE="$MEMORY_DIR/codex-iterations.json"
 
 # Defaults
 PROJECT=""
 SHOW_OUTPUT=false
 FOLLOW=false
 KILL=false
+LIST_HISTORY=false
 LIMIT=50
 
-# Parse arguments
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --project)
@@ -43,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       KILL=true
       shift
       ;;
+    --history|-H)
+      LIST_HISTORY=true
+      shift
+      ;;
     --limit|-n)
       LIMIT="$2"
       shift 2
@@ -55,6 +86,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --output, -o       Show session output"
       echo "  --follow, -f       Follow output (like tail -f)"
       echo "  --kill, -k         Kill running session"
+      echo "  --history, -H      Show iteration history"
       echo "  --limit <n>, -n    Limit output to N lines (default: 50)"
       echo "  --help, -h         Show this help"
       exit 0
@@ -72,7 +104,7 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
-# Normalize project name: extract basename if full path given
+# Normalize project name
 PROJECT=$(basename "$PROJECT")
 
 # Setup paths
@@ -80,7 +112,6 @@ PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
 OUTPUT_FILE="$ZOID_DIR/output.txt"
 SESSION_TRACKER="$ZOID_DIR/session.json"
-OPENCLAW_SESSION_FILE="$ZOID_DIR/openclaw-session.json"
 
 # Check if project exists
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -89,20 +120,21 @@ if [[ ! -d "$PROJECT_DIR" ]]; then
   exit 1
 fi
 
-# Kill mode
+# ============================================================================
+# KILL MODE
+# ============================================================================
+
 if [[ "$KILL" == true ]]; then
-  # Find codex processes for this project
   PIDS=$(pgrep -f "codex.*$PROJECT" || echo "")
   
   if [[ -n "$PIDS" ]]; then
     echo "Killing Codex processes for $PROJECT:"
-    echo "$PIDS" | while read pid; do
+    echo "$PIDS" | while read -r pid; do
       echo "  - $pid"
       kill -TERM "$pid" 2>/dev/null || true
     done
     sleep 2
-    # Force kill if still running
-    echo "$PIDS" | while read pid; do
+    echo "$PIDS" | while read -r pid; do
       if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
       fi
@@ -112,15 +144,53 @@ if [[ "$KILL" == true ]]; then
     echo "No running Codex processes found for $PROJECT"
   fi
   
-  # Update tracker if exists
   if [[ -f "$SESSION_TRACKER" ]]; then
-    jq '.status = "killed" | .killed_at = "'$(date -Iseconds)'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER" 2>/dev/null || true
+    jq '.status = "killed" | .killed_at = "'"$(date -Iseconds)"'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER" 2>/dev/null || true
   fi
   
   exit 0
 fi
 
-# Show status header
+# ============================================================================
+# HISTORY MODE
+# ============================================================================
+
+if [[ "$LIST_HISTORY" == true ]]; then
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  Iteration History: $PROJECT"
+  echo "═══════════════════════════════════════════════════════════════"
+  
+  if [[ -f "$ITERATIONS_FILE" ]]; then
+    ITERATIONS=$(jq -r ".$PROJECT // []" "$ITERATIONS_FILE" 2>/dev/null || echo "[]")
+    COUNT=$(echo "$ITERATIONS" | jq 'length')
+    
+    if [[ "$COUNT" -eq 0 ]]; then
+      echo "  No iteration history found."
+    else
+      echo "  Total iterations: $COUNT"
+      echo ""
+      
+      # Show last 10 iterations
+      echo "$ITERATIONS" | jq -r '.[-10:] | .[] | 
+        "────────────────────────────────────────────────────────────\n" +
+        "Timestamp: \(.timestamp)\n" +
+        "Status: \(.status)\n" +
+        "Session: \(.session_id)\n" +
+        "Prompt: \(.prompt | .[0:100])\(.prompt | if length > 100 then "..." else "" end)\n"
+      '
+    fi
+  else
+    echo "  No iteration history file found."
+  fi
+  
+  echo "═══════════════════════════════════════════════════════════════"
+  exit 0
+fi
+
+# ============================================================================
+# STATUS DISPLAY
+# ============================================================================
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Status: $PROJECT"
 echo "═══════════════════════════════════════════════════════════════"
@@ -129,11 +199,15 @@ echo "════════════════════════�
 if [[ -f "$SESSION_TRACKER" ]]; then
   STATUS=$(jq -r '.status // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
   SESSION_ID=$(jq -r '.session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  LOCAL_SESSION_ID=$(jq -r '.local_session_id // .session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
   STARTED=$(jq -r '.started_at // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
   COMPLETED=$(jq -r '.completed_at // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
+  EXIT_CODE=$(jq -r '.exit_code // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
   
-  echo "  Session ID: $SESSION_ID"
+  echo "  Local Session: $LOCAL_SESSION_ID"
+  echo "  Codex Session: $SESSION_ID"
   echo "  Status: $STATUS"
+  [[ "$EXIT_CODE" != "N/A" ]] && echo "  Exit Code: $EXIT_CODE"
   echo "  Started: $STARTED"
   [[ "$COMPLETED" != "N/A" ]] && echo "  Completed: $COMPLETED"
 else
@@ -141,20 +215,10 @@ else
   STATUS="unknown"
 fi
 
-# Check for OpenClaw background session
-OPENCLAW_SESSION_ID=""
-if [[ -f "$OPENCLAW_SESSION_FILE" ]]; then
-  OPENCLAW_SESSION_ID=$(jq -r '.openclaw_session_id // empty' "$OPENCLAW_SESSION_FILE" 2>/dev/null || echo "")
-  if [[ -n "$OPENCLAW_SESSION_ID" ]]; then
-    echo "  OpenClaw Session: $OPENCLAW_SESSION_ID"
-  fi
-fi
-
-# Check for running processes (both direct and OpenClaw-managed)
+# Check for running processes
 RUNNING_PIDS=$(pgrep -f "codex.*$PROJECT" || echo "")
 if [[ -n "$RUNNING_PIDS" ]]; then
-  echo "  Process: running (PIDs: $(echo $RUNNING_PIDS | tr '\n' ' '))"
-  # If status says completed but process is running, update
+  echo "  Process: running (PIDs: $(echo "$RUNNING_PIDS" | tr '\n' ' '))"
   if [[ "$STATUS" == "completed" || "$STATUS" == "unknown" ]]; then
     STATUS="running"
   fi
@@ -162,11 +226,24 @@ else
   echo "  Process: not running"
 fi
 
+# Show available output files
+if [[ -d "$ZOID_DIR" ]]; then
+  OUTPUT_FILES=$(find "$ZOID_DIR" -name "output*.txt" -type f 2>/dev/null | sort -r)
+  if [[ -n "$OUTPUT_FILES" ]]; then
+    echo ""
+    echo "  Output files:"
+    echo "$OUTPUT_FILES" | head -5 | while read -r f; do
+      SIZE=$(du -h "$f" 2>/dev/null | cut -f1)
+      echo "    - $(basename "$f") ($SIZE)"
+    done
+  fi
+fi
+
 # Show project info
+echo ""
 echo "  Directory: $PROJECT_DIR"
 echo "  Git repo: $([[ -d "$PROJECT_DIR/.git" ]] && echo "yes" || echo "no")"
 
-# Show recent git activity if git repo
 if [[ -d "$PROJECT_DIR/.git" ]]; then
   cd "$PROJECT_DIR"
   LAST_COMMIT=$(git log -1 --format="%h %s" 2>/dev/null || echo "none")
@@ -175,11 +252,21 @@ fi
 
 echo "═══════════════════════════════════════════════════════════════"
 
-# Show output if requested
+# ============================================================================
+# OUTPUT DISPLAY
+# ============================================================================
+
 if [[ "$SHOW_OUTPUT" == true ]]; then
   if [[ ! -f "$OUTPUT_FILE" ]]; then
     echo ""
     echo "No output file found."
+    
+    # Suggest other output files
+    OTHER_OUTPUTS=$(find "$ZOID_DIR" -name "output-*.txt" -type f 2>/dev/null | head -3)
+    if [[ -n "$OTHER_OUTPUTS" ]]; then
+      echo "Available output files:"
+      echo "$OTHER_OUTPUTS"
+    fi
     exit 0
   fi
   
@@ -194,19 +281,17 @@ if [[ "$SHOW_OUTPUT" == true ]]; then
   fi
 fi
 
-# Show hint if no output requested
-if [[ "$SHOW_OUTPUT" == false && "$KILL" == false ]]; then
+# ============================================================================
+# HINTS
+# ============================================================================
+
+if [[ "$SHOW_OUTPUT" == false && "$KILL" == false && "$LIST_HISTORY" == false ]]; then
   echo ""
-  if [[ -n "$OPENCLAW_SESSION_ID" && "$STATUS" == "running" ]]; then
-    echo "OpenClaw Process Commands:"
-    echo "  process action:poll sessionId:$OPENCLAW_SESSION_ID    # Check if running"
-    echo "  process action:log sessionId:$OPENCLAW_SESSION_ID     # View output"
-    echo "  process action:kill sessionId:$OPENCLAW_SESSION_ID    # Kill session"
-    echo ""
-  fi
-  echo "Traditional Commands:"
+  echo "Commands:"
   echo "  codex-status --project $PROJECT --output     # View output"
   echo "  codex-status --project $PROJECT --follow     # Follow live"
-  [[ "$STATUS" == "running" ]] && echo "  codex-status --project $PROJECT --kill       # Kill session (traditional)"
+  echo "  codex-status --project $PROJECT --history    # View iteration history"
+  [[ "$STATUS" == "running" ]] && echo "  codex-status --project $PROJECT --kill       # Kill session"
+  echo "  codex-resume --project $PROJECT              # Continue working"
   echo ""
 fi

@@ -5,16 +5,84 @@
 #
 
 set -e
+set -o pipefail  # FIX: Capture correct exit code from piped commands
 
-# Agent identity - hardcoded for Bender
-AGENT_NAME="Bender"
+# ============================================================================
+# CONFIGURATION & DETECTION
+# ============================================================================
+
+# Detect agent identity from environment or SOUL.md
+# Priority: AGENT_NAME env var > SOUL.md > fallback
+if [[ -n "$AGENT_NAME" ]]; then
+  DETECTED_AGENT="$AGENT_NAME"
+elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace-bender/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+else
+  DETECTED_AGENT="Unknown"
+fi
+
+AGENT_NAME="${DETECTED_AGENT:-Agent}"
 
 # Code lives in zoidcode (shared across all agents)
 CODE_BASE="/home/dan/zoidcode"
 
-# Session tracking is per-agent (in Bender's workspace memory)
-MEMORY_DIR="$HOME/.openclaw/workspace-bender/memory"
+# Session tracking is per-agent (in agent's workspace memory)
+# Detect workspace from environment or default
+if [[ -n "$OPENCLAW_WORKSPACE" ]]; then
+  WORKSPACE_DIR="$OPENCLAW_WORKSPACE"
+elif [[ -d "$HOME/.openclaw/workspace-bender" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace-bender"
+elif [[ -d "$HOME/.openclaw/workspace" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+else
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+fi
+
+MEMORY_DIR="$WORKSPACE_DIR/memory"
 SESSIONS_FILE="$MEMORY_DIR/codex-sessions.json"
+ITERATIONS_FILE="$MEMORY_DIR/codex-iterations.json"
+
+# Settings
+MAX_SESSIONS_PER_PROJECT=50  # Keep last N sessions per project
+MAX_ITERATIONS=1000          # Total iterations to keep across all projects
+
+# ============================================================================
+# DEPENDENCY CHECKS
+# ============================================================================
+
+# Check for jq
+if ! command -v jq &> /dev/null; then
+  echo "Error: jq is required but not installed. Install with: sudo apt-get install jq" >&2
+  exit 1
+fi
+
+# Check for flock (file locking)
+if ! command -v flock &> /dev/null; then
+  echo "Warning: flock not available. Session registry may have race conditions." >&2
+  HAS_FLOCK=false
+else
+  HAS_FLOCK=true
+fi
+
+# Check for codex CLI
+if ! command -v codex &> /dev/null; then
+  echo "Error: codex CLI not found. Install with: npm install -g @openai/codex" >&2
+  exit 1
+fi
+
+# Check for Mission Control CLI
+if ! command -v clawd &> /dev/null; then
+  echo "Error: clawd CLI not found in PATH. Mission Control integration unavailable." >&2
+  HAS_CLAWD=false
+else
+  HAS_CLAWD=true
+fi
+
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
 
 # Defaults
 PROJECT=""
@@ -23,9 +91,9 @@ FULL_AUTO=false
 DRY_RUN=false
 SUGGEST_CMD=false
 TIMEOUT=30
+VALIDATE_PROJECT=true
 PROMPT=""
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --project)
@@ -48,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       SUGGEST_CMD=true
       shift
       ;;
+    --no-validate)
+      VALIDATE_PROJECT=false
+      shift
+      ;;
     --timeout)
       TIMEOUT="$2"
       shift 2
@@ -61,8 +133,13 @@ while [[ $# -gt 0 ]]; do
       echo "  --full-auto       Auto-approve within workspace"
       echo "  --dry-run         Show what would execute"
       echo "  --suggest-cmd     Output OpenClaw exec command for background mode"
-      echo "  --timeout <min>   Kill after N minutes (default: 30)"
+      echo "  --no-validate     Skip Mission Control project validation"
+      echo "  --timeout <min>   Kill after N minutes (0 = no timeout, default: 30)"
       echo "  --help            Show this help"
+      echo ""
+      echo "Environment:"
+      echo "  AGENT_NAME        Override detected agent name"
+      echo "  OPENCLAW_WORKSPACE  Override workspace directory"
       exit 0
       ;;
     *)
@@ -84,13 +161,39 @@ if [[ -z "$PROMPT" ]]; then
   exit 1
 fi
 
-# Normalize project name: extract basename if full path given
-# /home/dan/zoidcode/mission_control_ui -> mission_control_ui
+# Normalize project name
 PROJECT=$(basename "$PROJECT")
 
-# Handle --suggest-cmd mode (output OpenClaw exec command)
+# ============================================================================
+# MISSION CONTROL VALIDATION
+# ============================================================================
+
+validate_project_in_mc() {
+  if [[ "$VALIDATE_PROJECT" == false ]]; then
+    return 0
+  fi
+  
+  if [[ "$HAS_CLAWD" == false ]]; then
+    echo "Warning: Cannot validate project - clawd not available" >&2
+    return 0
+  fi
+  
+  # Check if project exists in Mission Control
+  if ! clawd project list --json 2>/dev/null | jq -e ".[] | select(.folder == \"$PROJECT\")" > /dev/null 2>&1; then
+    echo "Error: Project '$PROJECT' not found in Mission Control." >&2
+    echo "Run 'clawd project list' to see available projects." >&2
+    echo "Use --no-validate to skip this check." >&2
+    exit 1
+  fi
+}
+
+validate_project_in_mc
+
+# ============================================================================
+# SUGGEST-CMD MODE
+# ============================================================================
+
 if [[ "$SUGGEST_CMD" == true ]]; then
-  # Build codex flags
   SUGGEST_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
   if [[ "$YOLO" == true ]]; then
     SUGGEST_FLAGS="$SUGGEST_FLAGS --yolo"
@@ -120,33 +223,69 @@ if [[ "$SUGGEST_CMD" == true ]]; then
   exit 0
 fi
 
-# Setup paths
+# ============================================================================
+# SETUP DIRECTORIES
+# ============================================================================
+
 PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
-OUTPUT_FILE="$ZOID_DIR/output.txt"
 
 # Create directories
 mkdir -p "$PROJECT_DIR"
 mkdir -p "$ZOID_DIR"
 mkdir -p "$MEMORY_DIR"
 
-# Initialize sessions file if missing
+# Initialize session files if missing
 if [[ ! -f "$SESSIONS_FILE" ]]; then
   echo "{}" > "$SESSIONS_FILE"
 fi
 
-# Check if this is a git repo, init if not
-if [[ ! -d "$PROJECT_DIR/.git" ]]; then
-  echo "Initializing git repository in $PROJECT_DIR..."
-  cd "$PROJECT_DIR"
-  git init -q
+if [[ ! -f "$ITERATIONS_FILE" ]]; then
+  echo "{}" > "$ITERATIONS_FILE"
+fi
+
+# ============================================================================
+# OUTPUT FILE ROTATION
+# ============================================================================
+
+# Rotate output files to preserve history
+# output.txt -> output-1.txt -> output-2.txt -> ... (shifting)
+rotate_output_files() {
+  local base_file="$ZOID_DIR/output"
+  local max_backups=9
   
-  # Create initial .gitignore
-  cat > "$PROJECT_DIR/.gitignore" << 'EOF'
+  # Shift existing backups
+  for ((i=max_backups-1; i>=1; i--)); do
+    if [[ -f "$base_file-$i.txt" ]]; then
+      mv "$base_file-$i.txt" "$base_file-$((i+1)).txt" 2>/dev/null || true
+    fi
+  done
+  
+  # Move current output to backup 1
+  if [[ -f "$base_file.txt" ]]; then
+    mv "$base_file.txt" "$base_file-1.txt" 2>/dev/null || true
+  fi
+}
+
+rotate_output_files
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+
+# ============================================================================
+# GIT INITIALIZATION
+# ============================================================================
+
+init_git_repo() {
+  if [[ ! -d "$PROJECT_DIR/.git" ]]; then
+    echo "Initializing git repository in $PROJECT_DIR..."
+    cd "$PROJECT_DIR"
+    git init -q
+    
+    # Create minimal .gitignore (not opinionated)
+    if [[ ! -f "$PROJECT_DIR/.gitignore" ]]; then
+      cat > "$PROJECT_DIR/.gitignore" << 'EOF'
 # Dependencies
 node_modules/
-.pnp
-.pnp.js
+vendor/
 
 # Build outputs
 dist/
@@ -157,13 +296,11 @@ out/
 # Environment
 .env
 .env.local
-.env.*.local
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
 
 # OS
@@ -173,20 +310,138 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
 # Testing
 coverage/
-.nyc_output/
 EOF
-fi
+    fi
+  fi
+}
 
-# Check for codex CLI
-if ! command -v codex &> /dev/null; then
-  echo "Error: codex CLI not found. Install with: npm install -g @openai/codex" >&2
-  exit 1
-fi
+init_git_repo
+
+# ============================================================================
+# SESSION REGISTRY HELPERS (with locking)
+# ============================================================================
+
+# Update sessions registry with file locking
+update_sessions_registry() {
+  local project="$1"
+  local session_id="$2"
+  local tracker_data="$3"
+  
+  local update_cmd="
+    import json, sys
+    data = json.load(sys.stdin)
+    data['$project'] = {
+      'current_session': '$session_id',
+      'last_updated': '$(date -Iseconds)',
+      'tracker': $tracker_data
+    }
+    
+    # Keep only last $MAX_SESSIONS_PER_PROJECT projects to prevent bloat
+    if len(data) > $MAX_SESSIONS_PER_PROJECT:
+      # Sort by last_updated and keep most recent
+      sorted_items = sorted(
+        data.items(),
+        key=lambda x: x[1].get('last_updated', ''),
+        reverse=True
+      )
+      data = dict(sorted_items[:$MAX_SESSIONS_PER_PROJECT])
+    
+    json.dump(data, sys.stdout, indent=2)
+  "
+  
+  if [[ "$HAS_FLOCK" == true ]]; then
+    (
+      flock -x 200
+      python3 -c "$update_cmd" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
+        mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
+    ) 200>"$SESSIONS_FILE.lock"
+  else
+    python3 -c "$update_cmd" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
+      mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
+  fi
+}
+
+# Add to iteration history
+add_iteration_history() {
+  local project="$1"
+  local session_id="$2"
+  local status="$3"
+  local prompt="$4"
+  
+  local iteration_entry="{
+    \"session_id\": \"$session_id\",
+    \"timestamp\": \"$(date -Iseconds)\",
+    \"status\": \"$status\",
+    \"prompt\": $(echo "$prompt" | jq -R -s .)
+  }"
+  
+  local update_cmd="
+    import json, sys
+    data = json.load(sys.stdin)
+    if '$project' not in data:
+      data['$project'] = []
+    data['$project'].append($iteration_entry)
+    
+    # Keep only last 100 iterations per project
+    if len(data['$project']) > 100:
+      data['$project'] = data['$project'][-100:]
+    
+    # Also enforce total limit
+    total = sum(len(v) for v in data.values())
+    if total > $MAX_ITERATIONS:
+      # Remove oldest from each project proportionally
+      while total > $MAX_ITERATIONS:
+        for proj in list(data.keys()):
+          if data[proj]:
+            data[proj].pop(0)
+            total -= 1
+            if total <= $MAX_ITERATIONS:
+              break
+    
+    json.dump(data, sys.stdout, indent=2)
+  "
+  
+  if [[ "$HAS_FLOCK" == true ]]; then
+    (
+      flock -x 200
+      python3 -c "$update_cmd" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
+        mv "$ITERATIONS_FILE.tmp" "$ITERATIONS_FILE"
+    ) 200>"$ITERATIONS_FILE.lock"
+  else
+    python3 -c "$update_cmd" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
+      mv "$ITERATIONS_FILE.tmp" "$ITERATIONS_FILE"
+  fi
+}
+
+# ============================================================================
+# SKILL LOGGING
+# ============================================================================
+
+log_skill_action() {
+  local status="$1"
+  local project="$2"
+  local prompt="$3"
+  
+  if [[ "$HAS_CLAWD" == false ]]; then
+    return 0
+  fi
+  
+  local short_prompt
+  short_prompt=$(echo "$prompt" | cut -c1-80)
+  if [[ ${#prompt} -gt 80 ]]; then
+    short_prompt="${short_prompt}..."
+  fi
+  
+  # Use clawd command (globally available)
+  clawd skill used "codex-agent" "Project: $project - $short_prompt" 2>/dev/null || true
+}
+
+# ============================================================================
+# BUILD & EXECUTE
+# ============================================================================
 
 # Build codex flags
 CODEX_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
@@ -195,20 +450,27 @@ if [[ "$YOLO" == true ]]; then
 elif [[ "$FULL_AUTO" == true ]]; then
   CODEX_FLAGS="$CODEX_FLAGS --full-auto"
 fi
-
-# Add JSON output for session ID extraction
 CODEX_FLAGS="$CODEX_FLAGS --json"
-
-# Add output file
 CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
 
-# Calculate timeout in seconds
-TIMEOUT_SEC=$((TIMEOUT * 60))
+# Calculate timeout
+if [[ "$TIMEOUT" -eq 0 ]]; then
+  TIMEOUT_CMD=""
+  TIMEOUT_DISPLAY="No timeout"
+else
+  TIMEOUT_SEC=$((TIMEOUT * 60))
+  TIMEOUT_CMD="timeout $TIMEOUT_SEC"
+  TIMEOUT_DISPLAY="${TIMEOUT} minutes"
+fi
+
+# Generate unique session ID
+SESSION_ID="$(date +%s)-$$-${RANDOM}"
 
 # Create session tracking file
 SESSION_TRACKER="$ZOID_DIR/session.json"
 cat > "$SESSION_TRACKER" << EOF
 {
+  "session_id": "$SESSION_ID",
   "project": "$PROJECT",
   "agent": "$AGENT_NAME",
   "started_at": "$(date -Iseconds)",
@@ -222,12 +484,16 @@ cat > "$SESSION_TRACKER" << EOF
 EOF
 
 # Show what we're doing
+MODE_LABEL="Sandbox"
+[[ "$YOLO" == true ]] && MODE_LABEL="YOLO (no sandbox)"
+[[ "$FULL_AUTO" == true ]] && MODE_LABEL="Full Auto"
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Agent: $AGENT_NAME"
 echo "  Project: $PROJECT"
 echo "  Directory: $PROJECT_DIR"
-echo "  Timeout: ${TIMEOUT} minutes"
-echo "  Mode: $([[ $YOLO == true ]] && echo 'YOLO (no sandbox)' || ([[ $FULL_AUTO == true ]] && echo 'Full Auto' || echo 'Sandbox'))"
+echo "  Timeout: $TIMEOUT_DISPLAY"
+echo "  Mode: $MODE_LABEL"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Prompt:"
@@ -237,86 +503,79 @@ echo ""
 if [[ "$DRY_RUN" == true ]]; then
   echo "[DRY RUN] Would execute:"
   echo "  cd $PROJECT_DIR"
-  echo "  timeout ${TIMEOUT_SEC}s codex $CODEX_FLAGS $(echo "$PROMPT" | jq -R -s .)"
+  echo "  $TIMEOUT_CMD codex $CODEX_FLAGS $(echo "$PROMPT" | jq -R -s .)"
   exit 0
 fi
 
 # Run codex
 echo "Starting Codex session..."
+echo "Session ID: $SESSION_ID"
 echo ""
 
 cd "$PROJECT_DIR"
 
-# Run with timeout and capture JSON output
-JSON_OUTPUT=$(mktemp)
-if timeout "$TIMEOUT_SEC" codex $CODEX_FLAGS "$PROMPT" 2>&1 | tee "$OUTPUT_FILE"; then
-  EXIT_CODE=$?
+# Run with timeout and capture output
+# FIX: Use pipefail to get correct exit code
+EXIT_CODE=0
+if $TIMEOUT_CMD codex $CODEX_FLAGS "$PROMPT" 2>&1 | tee "$OUTPUT_FILE"; then
+  EXIT_CODE=${PIPESTATUS[0]}
 else
-  EXIT_CODE=$?
+  EXIT_CODE=${PIPESTATUS[0]}
 fi
 
-# Check if we got a session ID from the JSON output
-SESSION_ID=""
+# Extract Codex session ID from output if available
+CODEX_SESSION_ID=""
 if [[ -f "$OUTPUT_FILE" ]]; then
-  # Try to extract session ID from first line (JSON format)
-  SESSION_ID=$(head -1 "$OUTPUT_FILE" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+  CODEX_SESSION_ID=$(head -1 "$OUTPUT_FILE" | jq -r '.session_id // empty' 2>/dev/null || echo "")
 fi
 
-# Update session tracker
-if [[ -n "$SESSION_ID" ]]; then
-  jq --arg sid "$SESSION_ID" '.session_id = $sid' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
-fi
+# Update session tracker with results
+jq --arg sid "$CODEX_SESSION_ID" --arg exit "$EXIT_CODE" '
+  .session_id = $sid |
+  .exit_code = ($exit | tonumber) |
+  .completed_at = "'$(date -Iseconds)'"
+' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
 
-# Log skill usage to Mission Control
-log_skill_action() {
-  local status=$1
-  local project=$2
-  local prompt="$3"
-  # Truncate prompt for logging
-  local short_prompt=$(echo "$prompt" | cut -c1-80)
-  if [[ ${#prompt} -gt 80 ]]; then
-    short_prompt="${short_prompt}..."
-  fi
-  
-  # Log via clawd CLI using 'skill used' for proper action type (suppress errors - don't break main flow)
-  /usr/bin/env node ~/clawd-team/clawd-cli.js skill used "codex-agent" "Project: $project - $short_prompt" 2>/dev/null || true
-}
-
-# Update status based on exit code
+# Determine final status
+FINAL_STATUS="unknown"
 if [[ $EXIT_CODE -eq 0 ]]; then
-  jq '.status = "completed" | .completed_at = "'$(date -Iseconds)'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+  FINAL_STATUS="completed"
+  jq '.status = "completed"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
   echo ""
   echo "✅ Codex session completed successfully"
-  # Log the skill usage
   log_skill_action "completed" "$PROJECT" "$PROMPT"
 elif [[ $EXIT_CODE -eq 124 ]]; then
-  jq '.status = "timeout" | .completed_at = "'$(date -Iseconds)'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+  FINAL_STATUS="timeout"
+  jq '.status = "timeout"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
   echo ""
-  echo "⏱️  Codex session timed out after ${TIMEOUT} minutes"
+  echo "⏱️  Codex session timed out after $TIMEOUT_DISPLAY"
   echo "   Use: codex-resume --project $PROJECT \"Continue from where you left off\""
+  log_skill_action "timeout" "$PROJECT" "$PROMPT"
 else
-  jq '.status = "failed" | .exit_code = '$EXIT_CODE' | .completed_at = "'$(date -Iseconds)'"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+  FINAL_STATUS="failed"
+  jq '.status = "failed"' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
   echo ""
   echo "❌ Codex session failed with exit code $EXIT_CODE"
+  log_skill_action "failed" "$PROJECT" "$PROMPT"
 fi
 
-# Update sessions registry
-TMP_FILE=$(mktemp)
-jq --arg proj "$PROJECT" --arg sid "$SESSION_ID" --arg track "$(cat "$SESSION_TRACKER")" '
-  .[$proj] = {
-    "current_session": $sid,
-    "last_updated": "'$(date -Iseconds)'",
-    "tracker": ($track | fromjson)
-  }
-' "$SESSIONS_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$SESSIONS_FILE"
+# Update registries
+TRACKER_DATA=$(cat "$SESSION_TRACKER" | jq -c .)
+update_sessions_registry "$PROJECT" "$CODEX_SESSION_ID" "$TRACKER_DATA"
+add_iteration_history "$PROJECT" "$SESSION_ID" "$FINAL_STATUS" "$PROMPT"
+
+# Cleanup old output files (keep last 10)
+find "$ZOID_DIR" -name "output-*.txt" -type f | sort -r | tail -n +11 | xargs rm -f 2>/dev/null || true
 
 # Show summary
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Session Summary"
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Session ID: ${SESSION_ID:-unknown}"
-echo "  Status: $(jq -r '.status' "$SESSION_TRACKER")"
+echo "  Session ID: ${SESSION_ID}"
+echo "  Codex Session: ${CODEX_SESSION_ID:-N/A}"
+echo "  Status: $FINAL_STATUS"
+echo "  Exit Code: $EXIT_CODE"
 echo "  Output: $OUTPUT_FILE"
 echo ""
 echo "  Next steps:"

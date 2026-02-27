@@ -1,37 +1,105 @@
 #!/bin/bash
 #
 # codex-resume: Resume a previous Codex session
-# Usage: codex-resume --project <name> "additional instructions"
+# Usage: codex-resume --project <name> [options] "additional instructions"
 #
 
 set -e
+set -o pipefail
 
-# Agent identity - hardcoded for Bender
-AGENT_NAME="Bender"
+# ============================================================================
+# CONFIGURATION & DETECTION
+# ============================================================================
 
-# Code lives in zoidcode (shared across all agents)
+# Detect agent identity
+if [[ -n "$AGENT_NAME" ]]; then
+  DETECTED_AGENT="$AGENT_NAME"
+elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
+  DETECTED_AGENT=$(grep -E "^# SOUL\.md|^# " "$HOME/.openclaw/workspace-bender/SOUL.md" 2>/dev/null | head -1 | sed 's/# SOUL\.md - //' | sed 's/# //' | tr -d '()' || echo "Unknown")
+else
+  DETECTED_AGENT="Unknown"
+fi
+
+AGENT_NAME="${DETECTED_AGENT:-Agent}"
+
 CODE_BASE="/home/dan/zoidcode"
 
-# Session tracking is per-agent (in Bender's workspace memory)
-MEMORY_DIR="$HOME/.openclaw/workspace-bender/memory"
+# Detect workspace
+if [[ -n "$OPENCLAW_WORKSPACE" ]]; then
+  WORKSPACE_DIR="$OPENCLAW_WORKSPACE"
+elif [[ -d "$HOME/.openclaw/workspace-bender" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace-bender"
+elif [[ -d "$HOME/.openclaw/workspace" ]]; then
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+else
+  WORKSPACE_DIR="$HOME/.openclaw/workspace"
+fi
+
+MEMORY_DIR="$WORKSPACE_DIR/memory"
 SESSIONS_FILE="$MEMORY_DIR/codex-sessions.json"
+ITERATIONS_FILE="$MEMORY_DIR/codex-iterations.json"
 
 # Defaults
 PROJECT=""
 PROMPT=""
+MODE="auto"  # auto, sandbox, full-auto, yolo
 
-# Parse arguments
+# ============================================================================
+# DEPENDENCY CHECKS
+# ============================================================================
+
+if ! command -v jq &> /dev/null; then
+  echo "Error: jq is required but not installed." >&2
+  exit 1
+fi
+
+if ! command -v codex &> /dev/null; then
+  echo "Error: codex CLI not found" >&2
+  exit 1
+fi
+
+if ! command -v clawd &> /dev/null; then
+  HAS_CLAWD=false
+else
+  HAS_CLAWD=true
+fi
+
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --project)
       PROJECT="$2"
       shift 2
       ;;
+    --yolo)
+      MODE="yolo"
+      shift
+      ;;
+    --full-auto)
+      MODE="full-auto"
+      shift
+      ;;
+    --sandbox)
+      MODE="sandbox"
+      shift
+      ;;
     --help|-h)
-      echo "Usage: codex-resume --project <name> \"additional instructions\""
+      echo "Usage: codex-resume --project <name> [options] \"additional instructions\""
       echo ""
       echo "Resumes the last Codex session for the specified project."
       echo "If no additional instructions provided, asks Codex to continue."
+      echo ""
+      echo "Options:"
+      echo "  --project <name>   Project name (required)"
+      echo "  --yolo            Skip sandbox, auto-approve"
+      echo "  --full-auto       Auto-approve within workspace (default)"
+      echo "  --sandbox         Use sandbox mode (asks for approval)"
+      echo "  --help            Show this help"
       exit 0
       ;;
     *)
@@ -47,50 +115,90 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
-# Normalize project name: extract basename if full path given
+# Normalize project name
 PROJECT=$(basename "$PROJECT")
 
-# Default prompt if none provided
+# Default prompt
 if [[ -z "$PROMPT" ]]; then
   PROMPT="Continue from where you left off. Complete the previous task."
 fi
 
-# Check sessions file exists
+# Check sessions file
 if [[ ! -f "$SESSIONS_FILE" ]]; then
   echo "Error: No sessions found. Use 'codex-do' first." >&2
   exit 1
 fi
 
-# Get session ID from registry
-SESSION_ID=$(jq -r ".[$PROJECT].current_session // empty" "$SESSIONS_FILE" 2>/dev/null || echo "")
+# Get session info from registry
+SESSION_DATA=$(jq -r ".[$PROJECT] // empty" "$SESSIONS_FILE" 2>/dev/null || echo "")
 
-if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
+if [[ -z "$SESSION_DATA" || "$SESSION_DATA" == "null" ]]; then
   echo "Error: No session found for project '$PROJECT'" >&2
   echo "Available projects:" >&2
   jq -r 'keys[]' "$SESSIONS_FILE" >&2
   exit 1
 fi
 
+SESSION_ID=$(echo "$SESSION_DATA" | jq -r '.current_session // empty')
+LOCAL_SESSION_ID=$(echo "$SESSION_DATA" | jq -r '.tracker.local_session_id // .tracker.session_id // .current_session // "unknown"')
+LAST_STATUS=$(echo "$SESSION_DATA" | jq -r '.tracker.status // "unknown"')
+
+if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
+  echo "Error: No session ID found for project '$PROJECT'" >&2
+  exit 1
+fi
+
 # Setup paths
 PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
-OUTPUT_FILE="$ZOID_DIR/output.txt"
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "Error: Project directory not found: $PROJECT_DIR" >&2
   exit 1
 fi
 
-# Check for codex CLI
-if ! command -v codex &> /dev/null; then
-  echo "Error: codex CLI not found" >&2
-  exit 1
+# Rotate output files before resuming
+rotate_output_files() {
+  local base_file="$ZOID_DIR/output"
+  local max_backups=9
+  
+  for ((i=max_backups-1; i>=1; i--)); do
+    if [[ -f "$base_file-$i.txt" ]]; then
+      mv "$base_file-$i.txt" "$base_file-$((i+1)).txt" 2>/dev/null || true
+    fi
+  done
+  
+  if [[ -f "$base_file.txt" ]]; then
+    mv "$base_file.txt" "$base_file-1.txt" 2>/dev/null || true
+  fi
+}
+
+rotate_output_files
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+
+# ============================================================================
+# BUILD FLAGS
+# ============================================================================
+
+CODEX_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
+
+if [[ "$MODE" == "yolo" ]]; then
+  CODEX_FLAGS="$CODEX_FLAGS --yolo"
+elif [[ "$MODE" == "full-auto" ]]; then
+  CODEX_FLAGS="$CODEX_FLAGS --full-auto"
 fi
 
-# Show info
+CODEX_FLAGS="$CODEX_FLAGS --json"
+CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
+
+# ============================================================================
+# EXECUTE
+# ============================================================================
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Resume: $AGENT_NAME"
 echo "  Project: $PROJECT"
+echo "  Last Status: $LAST_STATUS"
 echo "  Session: $SESSION_ID"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
@@ -98,60 +206,87 @@ echo "Additional instructions:"
 echo "  $PROMPT"
 echo ""
 
-# Create iteration tracker
-ITERATION_FILE="$ZOID_DIR/iteration_$(date +%s).json"
+# Generate new local session ID for this resume iteration
+NEW_LOCAL_SESSION="$(date +%s)-$$-${RANDOM}"
+
+# Create iteration record
+ITERATION_FILE="$ZOID_DIR/iteration_${NEW_LOCAL_SESSION}.json"
 cat > "$ITERATION_FILE" << EOF
 {
   "type": "resume",
-  "session_id": "$SESSION_ID",
+  "local_session_id": "$NEW_LOCAL_SESSION",
+  "codex_session_id": "$SESSION_ID",
   "timestamp": "$(date -Iseconds)",
-  "prompt": $(echo "$PROMPT" | jq -R -s .)
+  "prompt": $(echo "$PROMPT" | jq -R -s .),
+  "mode": "$MODE"
 }
 EOF
 
-# Run codex resume
+# Update session tracker
+SESSION_TRACKER="$ZOID_DIR/session.json"
+if [[ -f "$SESSION_TRACKER" ]]; then
+  jq --arg local_sid "$NEW_LOCAL_SESSION" --arg prompt "$PROMPT" '
+    .local_session_id = $local_sid |
+    .status = "running" |
+    .resumed_at = "'"$(date -Iseconds)"'" |
+    .resume_prompt = $prompt
+  ' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+fi
+
 cd "$PROJECT_DIR"
 
 echo "Resuming session..."
 echo ""
 
-# Run with JSON output and capture
-if codex exec --dangerously-bypass-approvals-and-sandbox --json -o "$OUTPUT_FILE" resume "$SESSION_ID" "$PROMPT"; then
-  EXIT_CODE=$?
-  STATUS="completed"
+# Run codex resume
+EXIT_CODE=0
+if codex $CODEX_FLAGS resume "$SESSION_ID" "$PROMPT" 2>&1 | tee "$OUTPUT_FILE"; then
+  EXIT_CODE=${PIPESTATUS[0]}
 else
-  EXIT_CODE=$?
-  STATUS="failed"
+  EXIT_CODE=${PIPESTATUS[0]}
 fi
 
-# Update session tracker
-SESSION_TRACKER="$ZOID_DIR/session.json"
-if [[ -f "$SESSION_TRACKER" ]]; then
-  jq --arg status "$STATUS" --arg time "$(date -Iseconds)" '.status = $status | .last_resume = $time' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
-fi
-
-# Log skill usage to Mission Control
+# Determine status
 if [[ $EXIT_CODE -eq 0 ]]; then
-  # Truncate prompt for logging
-  short_prompt=$(echo "$PROMPT" | cut -c1-80)
-  if [[ ${#PROMPT} -gt 80 ]]; then
-    short_prompt="${short_prompt}..."
-  fi
-  # Log via clawd CLI using 'skill used' for proper action type (suppress errors - don't break main flow)
-  /usr/bin/env node ~/clawd-team/clawd-cli.js skill used "codex-agent" "Resume project: $PROJECT - $short_prompt" 2>/dev/null || true
+  STATUS="completed"
+  ICON="✅"
+else
+  STATUS="failed"
+  ICON="❌"
 fi
+
+# Update tracker
+if [[ -f "$SESSION_TRACKER" ]]; then
+  jq --arg status "$STATUS" --arg exit "$EXIT_CODE" '
+    .status = $status |
+    .exit_code = ($exit | tonumber) |
+    .completed_at = "'"$(date -Iseconds)"'"
+  ' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
+fi
+
+# Log skill usage
+if [[ "$HAS_CLAWD" == true && $EXIT_CODE -eq 0 ]]; then
+  short_prompt=$(echo "$PROMPT" | cut -c1-80)
+  [[ ${#PROMPT} -gt 80 ]] && short_prompt="${short_prompt}..."
+  clawd skill used "codex-agent" "Resume project: $PROJECT - $short_prompt" 2>/dev/null || true
+fi
+
+# Cleanup old output files
+find "$ZOID_DIR" -name "output-*.txt" -type f | sort -r | tail -n +11 | xargs rm -f 2>/dev/null || true
 
 # Show summary
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Resume Result"
 echo "═══════════════════════════════════════════════════════════════"
-if [[ $EXIT_CODE -eq 0 ]]; then
-  echo "  Status: ✅ Completed"
-else
-  echo "  Status: ❌ Failed (exit code $EXIT_CODE)"
-fi
+echo "  Status: $ICON $STATUS"
+echo "  Exit Code: $EXIT_CODE"
+echo "  Local Session: $NEW_LOCAL_SESSION"
 echo "  Output: $OUTPUT_FILE"
+echo ""
+echo "  Next steps:"
+echo "    codex-status --project $PROJECT     # Check status"
+echo "    codex-resume --project $PROJECT     # Resume again if needed"
 echo "═══════════════════════════════════════════════════════════════"
 
 exit $EXIT_CODE
