@@ -19,10 +19,10 @@ else
   SOUL_FILE=""
   if [[ -n "$OPENCLAW_WORKSPACE" && -f "$OPENCLAW_WORKSPACE/SOUL.md" ]]; then
     SOUL_FILE="$OPENCLAW_WORKSPACE/SOUL.md"
-  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
-    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
     SOUL_FILE="$HOME/.openclaw/workspace-bender/SOUL.md"
+  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   fi
   
   if [[ -n "$SOUL_FILE" ]]; then

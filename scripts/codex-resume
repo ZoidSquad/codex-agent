@@ -20,10 +20,10 @@ else
   SOUL_FILE=""
   if [[ -n "$OPENCLAW_WORKSPACE" && -f "$OPENCLAW_WORKSPACE/SOUL.md" ]]; then
     SOUL_FILE="$OPENCLAW_WORKSPACE/SOUL.md"
-  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
-    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
     SOUL_FILE="$HOME/.openclaw/workspace-bender/SOUL.md"
+  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   fi
   
   if [[ -n "$SOUL_FILE" ]]; then
@@ -45,6 +45,7 @@ else
 fi
 
 AGENT_NAME="${DETECTED_AGENT:-Agent}"
+export AGENT_NAME
 
 CODE_BASE="/home/dan/zoidcode"
 
@@ -66,7 +67,7 @@ ITERATIONS_FILE="$MEMORY_DIR/codex-iterations.json"
 # Defaults
 PROJECT=""
 PROMPT=""
-MODE="auto"  # auto, sandbox, full-auto, yolo
+MODE="workspace-write"
 
 # ============================================================================
 # DEPENDENCY CHECKS
@@ -98,17 +99,18 @@ while [[ $# -gt 0 ]]; do
       PROJECT="$2"
       shift 2
       ;;
-    --yolo)
-      MODE="yolo"
-      shift
-      ;;
     --full-auto)
-      MODE="full-auto"
+      echo "Warning: --full-auto is no longer needed; codex-resume already uses unattended workspace-write sandbox mode." >&2
       shift
       ;;
     --sandbox)
-      MODE="sandbox"
+      echo "Warning: --sandbox is now the default behavior for codex-resume." >&2
       shift
+      ;;
+    --yolo)
+      echo "Error: --yolo is no longer supported. codex-resume always runs with -a never --sandbox workspace-write." >&2
+      shift
+      exit 1
       ;;
     --help|-h)
       echo "Usage: codex-resume --project <name> [options] \"additional instructions\""
@@ -116,11 +118,10 @@ while [[ $# -gt 0 ]]; do
       echo "Resumes the last Codex session for the specified project."
       echo "If no additional instructions provided, asks Codex to continue."
       echo ""
+      echo "codex-resume always runs Codex with: -a never exec --sandbox workspace-write resume"
+      echo ""
       echo "Options:"
       echo "  --project <name>   Project name (required)"
-      echo "  --yolo            Skip sandbox, auto-approve"
-      echo "  --full-auto       Auto-approve within workspace (default)"
-      echo "  --sandbox         Use sandbox mode (asks for approval)"
       echo "  --help            Show this help"
       exit 0
       ;;
@@ -202,14 +203,7 @@ OUTPUT_FILE="$ZOID_DIR/output.txt"
 # BUILD FLAGS
 # ============================================================================
 
-CODEX_FLAGS="exec --dangerously-bypass-approvals-and-sandbox"
-
-if [[ "$MODE" == "yolo" ]]; then
-  CODEX_FLAGS="$CODEX_FLAGS --yolo"
-elif [[ "$MODE" == "full-auto" ]]; then
-  CODEX_FLAGS="$CODEX_FLAGS --full-auto"
-fi
-
+CODEX_FLAGS="-a never exec --sandbox workspace-write"
 CODEX_FLAGS="$CODEX_FLAGS --json"
 CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
 

@@ -47,7 +47,7 @@ codex-resume --project mission_control_ui "Add dark mode toggle"
 ✅ Implementing complete user stories  
 ✅ Refactoring existing code  
 ✅ Bug fixes requiring multi-file changes  
-✅ Code review (in sandbox mode)  
+✅ Code review  
 ✅ Creating new projects from scratch  
 
 ❌ NOT for simple file edits (use `edit` tool instead)  
@@ -66,12 +66,12 @@ codex-do --project <folder_name> [options] "Your prompt here"
 
 **Options:**
 - `--project <name>` - Folder name from Mission Control (required)
-- `--yolo` - Skip sandbox, auto-approve all changes (dangerous!)
-- `--full-auto` - Auto-approve within workspace (safer than --yolo)
 - `--dry-run` - Show what would execute, don't run
 - `--suggest-cmd` - Output OpenClaw exec command for PTY/background mode
 - `--no-validate` - Skip Mission Control project validation
 - `--timeout <minutes>` - Kill after N minutes (0 = no timeout, default: 30)
+
+**Execution mode:** `codex-do` always runs Codex with `-a never exec --sandbox workspace-write`
 
 **Environment Variables:**
 - `AGENT_NAME` - Override detected agent name
@@ -87,21 +87,20 @@ codex-do --project <folder_name> [options] "Your prompt here"
 7. Captures output to `.zoid/output.txt`
 8. Updates session registry with file locking
 9. Logs iteration history
-10. Reports to Mission Control
+10. Logs Codex skill usage to Mission Control
 
 ### codex-resume
 
 Continue a previous session.
 
 ```bash
-codex-resume --project <folder_name> [options] "Additional instructions"
+codex-resume --project <folder_name> "Additional instructions"
 ```
 
 **Options:**
 - `--project <name>` - Project name (required)
-- `--yolo` - Skip sandbox, auto-approve
-- `--full-auto` - Auto-approve within workspace (default)
-- `--sandbox` - Use sandbox mode (asks for approval)
+
+**Execution mode:** `codex-resume` always runs Codex with `-a never exec --sandbox workspace-write resume`
 
 **Auto-finds** the last session ID from registry and continues with output rotation.
 
@@ -223,17 +222,16 @@ git commit -m "feat: add TaskCard component with priority badges"
 
 ## Safety Rules
 
-### The Safety Ladder
+### Execution Model
 
-Start safe, escalate only when needed:
+Use the wrapper's only supported mode:
 
-1. **First run**: No flags (sandbox mode, asks for approval)
-2. **Familiar project**: `--full-auto` (auto-approves in workspace)
-3. **Emergency only**: `--yolo` (no sandbox, no approvals)
+1. `codex-do`: `-a never exec --sandbox workspace-write`
+2. `codex-resume`: `-a never exec --sandbox workspace-write resume`
 
 ### Never Do This
 
-- ❌ `--yolo` on first run in unknown codebase
+- ❌ Bypass the wrapper and run unsandboxed Codex commands for normal project work
 - ❌ Run Codex in `~/clawd/` or system directories
 - ❌ Ignore error messages in output
 - ❌ Commit without reviewing changes
@@ -356,7 +354,7 @@ For long-running tasks, use OpenClaw's background mode:
 **Option 1: Use --suggest-cmd to get the command**
 ```bash
 # Get the proper OpenClaw exec command
-codex-do --project foo --suggest-cmd --full-auto "Build feature"
+codex-do --project foo --suggest-cmd "Build feature"
 # Copy the output and run it
 ```
 
@@ -364,7 +362,7 @@ codex-do --project foo --suggest-cmd --full-auto "Build feature"
 ```bash
 # Start with PTY and background mode
 exec pty:true background:true workdir:/home/dan/zoidcode/<project> \\
-  command:"codex exec --full-auto -o .zoid/output.txt 'Your task'"
+  command:"codex -a never exec --sandbox workspace-write -o .zoid/output.txt 'Your task'"
 # Returns: sessionId: xxx
 
 # Store the sessionId for tracking

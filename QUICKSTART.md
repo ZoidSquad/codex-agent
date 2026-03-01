@@ -83,23 +83,25 @@ Each project gets:
 codex-do --project myapp [flags] "prompt"
 
 Flags:
-  --full-auto       Auto-approve within workspace (recommended)
-  --yolo           Skip sandbox entirely (dangerous!)
   --timeout 0      No timeout (for long tasks)
   --dry-run        Show what would execute
   --no-validate    Skip Mission Control validation
   --suggest-cmd    Output OpenClaw exec command for PTY mode
 ```
 
+Execution mode:
+  codex-do always runs with -a never exec --sandbox workspace-write
+
 ### codex-resume
 ```bash
 codex-resume --project myapp [flags] "additional instructions"
 
 Flags:
-  --full-auto      Auto-approve (default)
-  --yolo          Skip sandbox
-  --sandbox       Ask for approval
+  (no mode flags)
 ```
+
+Execution mode:
+  codex-resume always runs with -a never exec --sandbox workspace-write resume
 
 ### codex-status
 ```bash
@@ -117,7 +119,7 @@ Flags:
 
 ```bash
 # 1. Start work
-codex-do --project mission_control_ui --full-auto "Build a todo list component"
+codex-do --project mission_control_ui "Build a todo list component"
 
 # 2. Check status (shows output files, history)
 codex-status --project mission_control_ui
@@ -126,7 +128,7 @@ codex-status --project mission_control_ui
 codex-status --project mission_control_ui --history
 
 # 4. If needed, continue
-codex-resume --project mission_control_ui --full-auto "Add delete functionality"
+codex-resume --project mission_control_ui "Add delete functionality"
 
 # 5. Review previous output
 cat /home/dan/zoidcode/mission_control_ui/.zoid/output-1.txt

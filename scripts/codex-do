@@ -21,10 +21,10 @@ else
   SOUL_FILE=""
   if [[ -n "$OPENCLAW_WORKSPACE" && -f "$OPENCLAW_WORKSPACE/SOUL.md" ]]; then
     SOUL_FILE="$OPENCLAW_WORKSPACE/SOUL.md"
-  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
-    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   elif [[ -f "$HOME/.openclaw/workspace-bender/SOUL.md" ]]; then
     SOUL_FILE="$HOME/.openclaw/workspace-bender/SOUL.md"
+  elif [[ -f "$HOME/.openclaw/workspace/SOUL.md" ]]; then
+    SOUL_FILE="$HOME/.openclaw/workspace/SOUL.md"
   fi
   
   if [[ -n "$SOUL_FILE" ]]; then
@@ -49,6 +49,7 @@ else
 fi
 
 AGENT_NAME="${DETECTED_AGENT:-Agent}"
+export AGENT_NAME
 
 # Code lives in zoidcode (shared across all agents)
 CODE_BASE="/home/dan/zoidcode"
@@ -111,8 +112,6 @@ fi
 
 # Defaults
 PROJECT=""
-YOLO=false
-FULL_AUTO=false
 DRY_RUN=false
 SUGGEST_CMD=false
 TIMEOUT=30
@@ -125,13 +124,14 @@ while [[ $# -gt 0 ]]; do
       PROJECT="$2"
       shift 2
       ;;
-    --yolo)
-      YOLO=true
+    --full-auto)
+      echo "Warning: --full-auto is no longer needed; codex-do already uses unattended workspace-write sandbox mode." >&2
       shift
       ;;
-    --full-auto)
-      FULL_AUTO=true
+    --yolo)
+      echo "Error: --yolo is no longer supported. codex-do always runs with -a never --sandbox workspace-write." >&2
       shift
+      exit 1
       ;;
     --dry-run)
       DRY_RUN=true
@@ -152,10 +152,10 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       echo "Usage: codex-do --project <name> [options] \"prompt\""
       echo ""
+      echo "codex-do always runs Codex with: -a never exec --sandbox workspace-write"
+      echo ""
       echo "Options:"
       echo "  --project <name>   Project slug (required)"
-      echo "  --yolo            Skip sandbox, auto-approve (dangerous!)"
-      echo "  --full-auto       Auto-approve within workspace"
       echo "  --dry-run         Show what would execute"
       echo "  --suggest-cmd     Output OpenClaw exec command for background mode"
       echo "  --no-validate     Skip Mission Control project validation"
@@ -204,7 +204,7 @@ validate_project_in_mc() {
   fi
   
   # Check if project exists in Mission Control
-  if ! clawd project list --json 2>/dev/null | jq -e ".[] | select(.folder == \"$PROJECT\")" > /dev/null 2>&1; then
+  if ! clawd project list --json 2>/dev/null | jq -e ".[] | select(.name == \"$PROJECT\" or .folder == \"$PROJECT\")" > /dev/null 2>&1; then
     echo "Error: Project '$PROJECT' not found in Mission Control." >&2
     echo "Run 'clawd project list' to see available projects." >&2
     echo "Use --no-validate to skip this check." >&2
@@ -219,13 +219,8 @@ validate_project_in_mc
 # ============================================================================
 
 if [[ "$SUGGEST_CMD" == true ]]; then
-  # Build flags - -a never goes BEFORE exec
-  SUGGEST_FLAGS="exec"
-  if [[ "$YOLO" == true ]]; then
-    SUGGEST_FLAGS="-a never $SUGGEST_FLAGS --dangerously-bypass-approvals-and-sandbox"
-  else
-    SUGGEST_FLAGS="-a never $SUGGEST_FLAGS --sandbox workspace-write"
-  fi
+  # Keep the recommended OpenClaw command aligned with the single supported mode.
+  SUGGEST_FLAGS="-a never exec --sandbox workspace-write"
   SUGGEST_FLAGS="$SUGGEST_FLAGS --json"
   
   PROJECT_DIR="$CODE_BASE/$PROJECT"
@@ -469,16 +464,8 @@ log_skill_action() {
 # BUILD & EXECUTE
 # ============================================================================
 
-# Build codex flags
-# NOTE: -a never goes BEFORE exec, not after
-CODEX_FLAGS="exec"
-if [[ "$YOLO" == true ]]; then
-  # YOLO mode: no sandbox, no approvals (dangerous)
-  CODEX_FLAGS="-a never $CODEX_FLAGS --dangerously-bypass-approvals-and-sandbox"
-else
-  # Default: auto-approve, sandboxed to workspace
-  CODEX_FLAGS="-a never $CODEX_FLAGS --sandbox workspace-write"
-fi
+# Build codex flags for the single supported execution mode.
+CODEX_FLAGS="-a never exec --sandbox workspace-write"
 CODEX_FLAGS="$CODEX_FLAGS --json"
 CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
 
@@ -506,14 +493,14 @@ cat > "$SESSION_TRACKER" << EOF
   "prompt": $(echo "$PROMPT" | jq -R -s .),
   "status": "running",
   "flags": {
-    "yolo": $YOLO
+    "approval_policy": "never",
+    "sandbox": "workspace-write"
   }
 }
 EOF
 
 # Show what we're doing
-MODE_LABEL="Auto (sandboxed)"
-[[ "$YOLO" == true ]] && MODE_LABEL="YOLO (no sandbox)"
+MODE_LABEL="Unattended workspace-write sandbox"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Agent: $AGENT_NAME"
