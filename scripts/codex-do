@@ -245,11 +245,53 @@ if [[ "$SUGGEST_CMD" == true ]]; then
 fi
 
 # ============================================================================
-# SETUP DIRECTORIES
+# EXECUTION PATHS
 # ============================================================================
 
 PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+
+# Build codex flags for the single supported execution mode.
+CODEX_FLAGS="-a never exec --sandbox workspace-write"
+CODEX_FLAGS="$CODEX_FLAGS --json"
+CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
+
+# Calculate timeout
+if [[ "$TIMEOUT" -eq 0 ]]; then
+  TIMEOUT_CMD=""
+  TIMEOUT_DISPLAY="No timeout"
+else
+  TIMEOUT_SEC=$((TIMEOUT * 60))
+  TIMEOUT_CMD="timeout $TIMEOUT_SEC"
+  TIMEOUT_DISPLAY="${TIMEOUT} minutes"
+fi
+
+MODE_LABEL="Unattended workspace-write sandbox"
+
+# Show what we're doing before deciding whether to execute or only preview.
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Codex Agent: $AGENT_NAME"
+echo "  Project: $PROJECT"
+echo "  Directory: $PROJECT_DIR"
+echo "  Timeout: $TIMEOUT_DISPLAY"
+echo "  Mode: $MODE_LABEL"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Prompt:"
+echo "  $PROMPT"
+echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "[DRY RUN] Would execute:"
+  echo "  cd $PROJECT_DIR"
+  echo "  $TIMEOUT_CMD codex $CODEX_FLAGS $(echo "$PROMPT" | jq -R -s .)"
+  exit 0
+fi
+
+# ============================================================================
+# SETUP DIRECTORIES
+# ============================================================================
 
 # Create directories
 mkdir -p "$PROJECT_DIR"
@@ -289,7 +331,6 @@ rotate_output_files() {
 }
 
 rotate_output_files
-OUTPUT_FILE="$ZOID_DIR/output.txt"
 
 # ============================================================================
 # GIT INITIALIZATION
@@ -464,21 +505,6 @@ log_skill_action() {
 # BUILD & EXECUTE
 # ============================================================================
 
-# Build codex flags for the single supported execution mode.
-CODEX_FLAGS="-a never exec --sandbox workspace-write"
-CODEX_FLAGS="$CODEX_FLAGS --json"
-CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
-
-# Calculate timeout
-if [[ "$TIMEOUT" -eq 0 ]]; then
-  TIMEOUT_CMD=""
-  TIMEOUT_DISPLAY="No timeout"
-else
-  TIMEOUT_SEC=$((TIMEOUT * 60))
-  TIMEOUT_CMD="timeout $TIMEOUT_SEC"
-  TIMEOUT_DISPLAY="${TIMEOUT} minutes"
-fi
-
 # Generate unique session ID
 SESSION_ID="$(date +%s)-$$-${RANDOM}"
 
@@ -498,28 +524,6 @@ cat > "$SESSION_TRACKER" << EOF
   }
 }
 EOF
-
-# Show what we're doing
-MODE_LABEL="Unattended workspace-write sandbox"
-
-echo "═══════════════════════════════════════════════════════════════"
-echo "  Codex Agent: $AGENT_NAME"
-echo "  Project: $PROJECT"
-echo "  Directory: $PROJECT_DIR"
-echo "  Timeout: $TIMEOUT_DISPLAY"
-echo "  Mode: $MODE_LABEL"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "Prompt:"
-echo "  $PROMPT"
-echo ""
-
-if [[ "$DRY_RUN" == true ]]; then
-  echo "[DRY RUN] Would execute:"
-  echo "  cd $PROJECT_DIR"
-  echo "  $TIMEOUT_CMD codex $CODEX_FLAGS $(echo "$PROMPT" | jq -R -s .)"
-  exit 0
-fi
 
 # Run codex
 echo "Starting Codex session..."

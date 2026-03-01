@@ -135,6 +135,16 @@ ZOID_DIR="$PROJECT_DIR/.zoid"
 OUTPUT_FILE="$ZOID_DIR/output.txt"
 SESSION_TRACKER="$ZOID_DIR/session.json"
 
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\/]/\\&/g'
+}
+
+build_codex_process_pattern() {
+  local escaped_output
+  escaped_output=$(escape_regex "$OUTPUT_FILE")
+  printf '(^|/)codex( |$).*-o[[:space:]]+%s([[:space:]]|$)' "$escaped_output"
+}
+
 # Check if project exists
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "Error: Project not found: $PROJECT" >&2
@@ -147,8 +157,8 @@ fi
 # ============================================================================
 
 if [[ "$KILL" == true ]]; then
-  # Use [c]odex pattern to avoid matching the pgrep command itself
-  PIDS=$(pgrep -f "[c]odex.*$PROJECT" || echo "")
+  PROCESS_PATTERN=$(build_codex_process_pattern)
+  PIDS=$(pgrep -f "$PROCESS_PATTERN" || echo "")
   
   if [[ -n "$PIDS" ]]; then
     echo "Killing Codex processes for $PROJECT:"
@@ -238,9 +248,9 @@ else
   STATUS="unknown"
 fi
 
-# Check for running processes
-  # Use [c]odex pattern to avoid matching the pgrep command itself
-RUNNING_PIDS=$(pgrep -f "[c]odex.*$PROJECT" || echo "")
+# Check for running processes by the output file path passed to Codex.
+PROCESS_PATTERN=$(build_codex_process_pattern)
+RUNNING_PIDS=$(pgrep -f "$PROCESS_PATTERN" || echo "")
 if [[ -n "$RUNNING_PIDS" ]]; then
   echo "  Process: running (PIDs: $(echo "$RUNNING_PIDS" | tr '\n' ' '))"
   if [[ "$STATUS" == "completed" || "$STATUS" == "unknown" ]]; then
