@@ -1,0 +1,231 @@
+#!/bin/bash
+#
+# codex-branch: Prepare or switch to the task branch for a project
+# Usage: codex-branch --project <name> --task-id <id> [options]
+#
+
+set -euo pipefail
+
+CODE_BASE="/home/dan/zoidcode"
+
+PROJECT=""
+TASK_ID=""
+BASE_BRANCH=""
+JSON_OUTPUT=false
+
+usage() {
+  cat <<'EOF'
+Usage: codex-branch --project <name> --task-id <id> [options]
+
+Prepare the git branch used for a Mission Control task. The default branch name is
+the full task ID so the branch is stable across reopen/review cycles.
+
+Options:
+  --project <name>   Project folder name from Mission Control (required)
+  --task-id <id>     Mission Control task ID / target branch name (required)
+  --base <branch>    Base branch to branch from (default: dev, then main, then master, then current branch)
+  --json             Output machine-readable result
+  --help, -h         Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --task-id)
+      TASK_ID="$2"
+      shift 2
+      ;;
+    --base)
+      BASE_BRANCH="$2"
+      shift 2
+      ;;
+    --json)
+      JSON_OUTPUT=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$PROJECT" ]]; then
+  echo "Error: --project is required" >&2
+  exit 1
+fi
+
+if [[ -z "$TASK_ID" ]]; then
+  echo "Error: --task-id is required" >&2
+  exit 1
+fi
+
+PROJECT=$(basename "$PROJECT")
+PROJECT_DIR="$CODE_BASE/$PROJECT"
+TARGET_BRANCH="$TASK_ID"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "Error: Project directory not found: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Error: $PROJECT_DIR is not a git repository." >&2
+  exit 1
+fi
+
+get_current_branch() {
+  git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+branch_exists_local() {
+  git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$1"
+}
+
+branch_exists_remote() {
+  git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/remotes/origin/$1"
+}
+
+repo_dirty() {
+  [[ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]]
+}
+
+require_clean_switch() {
+  local current_branch
+  current_branch="$1"
+  if repo_dirty; then
+    echo "Error: Refusing to switch task branches with a dirty worktree in $PROJECT_DIR." >&2
+    if [[ -n "$current_branch" ]]; then
+      echo "Current branch: $current_branch" >&2
+    fi
+    echo "Commit, stash, or move the current changes before switching tasks." >&2
+    exit 1
+  fi
+}
+
+resolve_base_branch() {
+  local current_branch
+  current_branch="$1"
+
+  if [[ -n "$BASE_BRANCH" ]]; then
+    if branch_exists_local "$BASE_BRANCH"; then
+      printf '%s' "$BASE_BRANCH"
+      return 0
+    fi
+    if branch_exists_remote "$BASE_BRANCH"; then
+      printf 'origin/%s' "$BASE_BRANCH"
+      return 0
+    fi
+    echo "Error: Base branch '$BASE_BRANCH' not found locally or on origin." >&2
+    exit 1
+  fi
+
+  for candidate in dev main master; do
+    if branch_exists_local "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    if branch_exists_remote "$candidate"; then
+      printf 'origin/%s' "$candidate"
+      return 0
+    fi
+  done
+
+  if [[ -n "$current_branch" ]]; then
+    printf '%s' "$current_branch"
+    return 0
+  fi
+
+  echo "Error: Could not determine a base branch. Use --base <branch>." >&2
+  exit 1
+}
+
+CURRENT_BRANCH="$(get_current_branch)"
+RESULT_BRANCH=""
+ACTION=""
+USED_BASE_BRANCH=""
+
+if [[ "$CURRENT_BRANCH" == "$TARGET_BRANCH" ]]; then
+  ACTION="already_on_branch"
+  RESULT_BRANCH="$CURRENT_BRANCH"
+elif branch_exists_local "$TARGET_BRANCH"; then
+  require_clean_switch "$CURRENT_BRANCH"
+  git -C "$PROJECT_DIR" checkout "$TARGET_BRANCH" >/dev/null 2>&1
+  ACTION="switched_existing"
+  RESULT_BRANCH="$(get_current_branch)"
+elif branch_exists_remote "$TARGET_BRANCH"; then
+  require_clean_switch "$CURRENT_BRANCH"
+  git -C "$PROJECT_DIR" checkout -b "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" >/dev/null 2>&1
+  ACTION="tracking_remote"
+  RESULT_BRANCH="$(get_current_branch)"
+else
+  require_clean_switch "$CURRENT_BRANCH"
+  USED_BASE_BRANCH="$(resolve_base_branch "$CURRENT_BRANCH")"
+  git -C "$PROJECT_DIR" checkout -b "$TARGET_BRANCH" "$USED_BASE_BRANCH" >/dev/null 2>&1
+  ACTION="created"
+  RESULT_BRANCH="$(get_current_branch)"
+fi
+
+if [[ -z "$RESULT_BRANCH" ]]; then
+  echo "Error: Failed to determine current branch after switching." >&2
+  exit 1
+fi
+
+if [[ "$JSON_OUTPUT" == true ]]; then
+  if [[ -n "$CURRENT_BRANCH" ]]; then
+    PREVIOUS_BRANCH_JSON=$(printf '%s' "$CURRENT_BRANCH" | jq -R .)
+  else
+    PREVIOUS_BRANCH_JSON="null"
+  fi
+
+  if [[ -n "$USED_BASE_BRANCH" ]]; then
+    BASE_BRANCH_JSON=$(printf '%s' "$USED_BASE_BRANCH" | jq -R .)
+  else
+    BASE_BRANCH_JSON="null"
+  fi
+
+  CREATED_JSON=false
+  if [[ "$ACTION" == "created" || "$ACTION" == "tracking_remote" ]]; then
+    CREATED_JSON=true
+  fi
+
+  jq -n \
+    --arg project "$PROJECT" \
+    --arg directory "$PROJECT_DIR" \
+    --arg task_id "$TASK_ID" \
+    --arg branch "$RESULT_BRANCH" \
+    --arg action "$ACTION" \
+    --argjson previous_branch "$PREVIOUS_BRANCH_JSON" \
+    --argjson base_branch "$BASE_BRANCH_JSON" \
+    --argjson created "$CREATED_JSON" \
+    '{
+      project: $project,
+      directory: $directory,
+      task_id: $task_id,
+      branch: $branch,
+      action: $action,
+      previous_branch: $previous_branch,
+      base_branch: $base_branch,
+      created: $created
+    }'
+  exit 0
+fi
+
+echo "Prepared task branch for $PROJECT"
+echo "  Branch: $RESULT_BRANCH"
+[[ -n "$CURRENT_BRANCH" ]] && echo "  Previous: $CURRENT_BRANCH"
+[[ -n "$USED_BASE_BRANCH" ]] && echo "  Base: $USED_BASE_BRANCH"
+echo "  Action: $ACTION"
+echo ""
+echo "Next steps:"
+echo "  codex-status --project $PROJECT --json"
+echo "  codex-do --project $PROJECT --task-id $TASK_ID --background \"<prompt>\""

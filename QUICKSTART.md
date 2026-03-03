@@ -9,19 +9,20 @@ npm install -g @openai/codex   # Required for coding agent
 # clawd should be globally available in PATH
 ```
 
-## Three Commands
+## Core Commands
 
 | Command | Purpose | Example |
 |---------|---------|---------|
-| `codex-do` | Start new work | `codex-do --project myapp "Build login"` |
-| `codex-resume` | Continue session | `codex-resume --project myapp "Add validation"` |
-| `codex-status` | Check/view output | `codex-status --project myapp --output` |
+| `codex-branch` | Prepare/switch to the task branch | `codex-branch --project myapp --task-id k176...` |
+| `codex-do` | Start tracked work | `codex-do --project myapp --task-id k176... --background "Build login"` |
+| `codex-resume` | Continue session | `codex-resume --project myapp --task-id k176... --background "Add validation"` |
+| `codex-status` | Inspect current state | `codex-status --project myapp --json` |
 
 ## Installation
 
 Scripts should be in your agent's skills directory:
 ```bash
-~/.openclaw/workspace/skills/codex-agent/scripts/
+~/.openclaw/skills/codex-agent/scripts/
 ```
 
 Or reference them directly from this repo when testing:
@@ -78,12 +79,26 @@ Each project gets:
 
 ## Common Options
 
+### codex-branch
+```bash
+codex-branch --project myapp --task-id k176w64p843g1brae8zmqys6qs820knf [flags]
+
+Flags:
+  --base <branch>  Branch to branch from (default: dev, then main, then master)
+  --json           Machine-readable result
+```
+
+For task-tracked work, the branch name is the full task ID.
+
 ### codex-do
 ```bash
 codex-do --project myapp [flags] "prompt"
 
 Flags:
-  --timeout 0      No timeout (for long tasks)
+  --task-id <id>   Attach a Mission Control task ID
+  --background     Start Codex in a tracked detached process
+  --force          Bypass duplicate-run guard for the project
+  --timeout 0      No timeout (default)
   --dry-run        Show what would execute
   --no-validate    Skip Mission Control validation
   --suggest-cmd    Output OpenClaw exec command for PTY mode
@@ -92,22 +107,32 @@ Flags:
 Execution mode:
   codex-do always runs with -a never exec --sandbox workspace-write
 
+Tracked task rule:
+  If you pass --task-id, the current git branch must match that task ID.
+  Use codex-branch first.
+
 ### codex-resume
 ```bash
 codex-resume --project myapp [flags] "additional instructions"
 
 Flags:
-  (no mode flags)
+  --task-id <id>   Override or attach a Mission Control task ID
+  --background     Resume in a tracked detached process
+  --force          Bypass duplicate-run guard for the project
 ```
 
 Execution mode:
   codex-resume always runs with -a never exec --sandbox workspace-write resume
+
+Tracked task rule:
+  Resume task-bound work on the same task branch you started on.
 
 ### codex-status
 ```bash
 codex-status --project myapp [flags]
 
 Flags:
+  --json           Machine-readable status
   --output, -o     Show output
   --follow, -f     Follow live output (tail -f)
   --history, -H    Show iteration history
@@ -118,22 +143,25 @@ Flags:
 ## Typical Session
 
 ```bash
-# 1. Start work
-codex-do --project mission_control_ui "Build a todo list component"
+# 1. Check whether work is already running
+codex-status --project mission_control_ui --json
 
-# 2. Check status (shows output files, history)
-codex-status --project mission_control_ui
+# 2. Prepare the task branch
+codex-branch --project mission_control_ui --task-id <task-id>
 
-# 3. View iteration history
-codex-status --project mission_control_ui --history
+# 3. Start tracked background work
+codex-do --project mission_control_ui --task-id <task-id> --background "Build a todo list component"
 
-# 4. If needed, continue
-codex-resume --project mission_control_ui "Add delete functionality"
+# 4. Inspect current state
+codex-status --project mission_control_ui --json
 
-# 5. Review previous output
+# 5. If needed, continue later on the same task branch
+codex-resume --project mission_control_ui --task-id <task-id> --background "Add delete functionality"
+
+# 6. Review previous output
 cat /home/dan/zoidcode/mission_control_ui/.zoid/output-1.txt
 
-# 6. Commit changes
+# 7. Commit changes on the task branch
 cd /home/dan/zoidcode/mission_control_ui
 git add .
 git commit -m "feat: add todo list with delete"
@@ -158,6 +186,7 @@ export OPENCLAW_WORKSPACE="/path/to/workspace"
 | "clawd not found" | Ensure `clawd` is in PATH |
 | Session hangs | `codex-status --project X --kill` |
 | Lost session ID | Check `codex-sessions.json` or start fresh |
+| Need orchestration logic | Use `codex-status --project X --json` first |
 | Want to start over | `rm -rf /home/dan/zoidcode/<project>` |
 | File too big | Old outputs auto-deleted, check output-1.txt etc |
 

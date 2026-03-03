@@ -3,7 +3,7 @@ name: codex-agent
 description: |
   Automated Codex CLI integration for software development tasks.
   Use when you need to write, modify, or review code in a project.
-  Handles session tracking, git setup, output capture, and resume automatically.
+  Handles session tracking, detached execution, output capture, and resume automatically.
   Production-hardened with file locking, output rotation, and iteration history.
   Trigger phrases: "build a feature", "implement", "code", "develop", "create app",
   "add component", "fix bug", "refactor", "write tests".
@@ -20,6 +20,10 @@ Automated Codex CLI wrapper with session tracking. All code lives in `/home/dan/
 - ✅ **Output rotation** - Preserves history (output.txt, output-1.txt, output-2.txt...)
 - ✅ **Iteration history** - Full log of all work sessions per project
 - ✅ **Mission Control validation** - Ensures project exists before working
+- ✅ **Tracked background execution** - Start Codex once and inspect it across cron turns
+- ✅ **Machine-readable status** - `codex-status --json` for reliable orchestration
+- ✅ **Duplicate-run guard** - Prevents overlapping Codex launches in the same repo by default
+- ✅ **Task-branch enforcement** - Tracked task work stays on a deterministic git branch per task
 - ✅ **Fixed exit codes** - Correctly reports Codex failure/success
 - ✅ **Fixed CLI path** - Uses `clawd` instead of old `~/clawd-team/` path
 - ✅ **Configurable timeout** - Use `--timeout 0` for no timeout
@@ -28,17 +32,17 @@ Automated Codex CLI wrapper with session tracking. All code lives in `/home/dan/
 ## Quick Start
 
 ```bash
-# Start working on a project (use folder name from Mission Control)
-codex-do --project mission_control_ui "Build a React kanban board"
+# Prepare the task branch first
+codex-branch --project mission_control_ui --task-id k176w64p843g1brae8zmqys6qs820knf
+
+# Start tracked background work
+codex-do --project mission_control_ui --task-id k176w64p843g1brae8zmqys6qs820knf --background "Build a React kanban board"
 
 # Check progress
-codex-status --project mission_control_ui
+codex-status --project mission_control_ui --json
 
-# View iteration history
-codex-status --project mission_control_ui --history
-
-# Continue working
-codex-resume --project mission_control_ui "Add dark mode toggle"
+# Continue later if needed
+codex-resume --project mission_control_ui --task-id k176w64p843g1brae8zmqys6qs820knf --background "Add dark mode toggle"
 ```
 
 ## When to Use This Skill
@@ -56,6 +60,22 @@ codex-resume --project mission_control_ui "Add dark mode toggle"
 
 ## Core Commands
 
+### codex-branch
+
+Prepare or switch to the task branch for tracked work.
+
+```bash
+codex-branch --project <folder_name> --task-id <task-id> [options]
+```
+
+**Options:**
+- `--project <name>` - Folder name from Mission Control (required)
+- `--task-id <id>` - Mission Control task ID / target branch name (required)
+- `--base <branch>` - Base branch to branch from (default: `dev`, then `main`, then `master`)
+- `--json` - Machine-readable result
+
+**Task branch rule:** For task-tracked work, the branch name is the full task ID. Reopened tasks continue on the same branch.
+
 ### codex-do
 
 Main entry point for starting work.
@@ -66,12 +86,17 @@ codex-do --project <folder_name> [options] "Your prompt here"
 
 **Options:**
 - `--project <name>` - Folder name from Mission Control (required)
+- `--task-id <id>` - Mission Control task ID to tie to the tracked session
+- `--background` - Launch Codex in a tracked detached process
 - `--dry-run` - Show what would execute, don't run
+- `--force` - Bypass the duplicate-run guard for the project
 - `--suggest-cmd` - Output OpenClaw exec command for PTY/background mode
 - `--no-validate` - Skip Mission Control project validation
-- `--timeout <minutes>` - Kill after N minutes (0 = no timeout, default: 30)
+- `--timeout <minutes>` - Kill after N minutes (0 = no timeout, default: 0)
 
 **Execution mode:** `codex-do` always runs Codex with `-a never exec --sandbox workspace-write`
+
+**Task branch rule:** If you pass `--task-id`, the current git branch must match that task ID. Use `codex-branch` first.
 
 **Environment Variables:**
 - `AGENT_NAME` - Override detected agent name
@@ -81,13 +106,14 @@ codex-do --project <folder_name> [options] "Your prompt here"
 1. Validates project exists in Mission Control (unless `--no-validate`)
 2. Checks for project in `/home/dan/zoidcode/<folder>/`
 3. Creates folder if missing (with git init)
-4. Rotates output files (preserves history)
-5. Creates `.zoid/` directory with session tracking
-6. Runs Codex with proper flags
-7. Captures output to `.zoid/output.txt`
-8. Updates session registry with file locking
-9. Logs iteration history
-10. Logs Codex skill usage to Mission Control
+4. Refuses to start if Codex is already active in that repo (unless `--force`)
+5. Rotates output files (preserves history)
+6. Creates `.zoid/` directory with session tracking
+7. Runs Codex with proper flags
+8. Captures output to `.zoid/output.txt`
+9. Updates session registry with file locking
+10. Logs iteration history
+11. Logs Codex skill usage to Mission Control
 
 ### codex-resume
 
@@ -99,10 +125,13 @@ codex-resume --project <folder_name> "Additional instructions"
 
 **Options:**
 - `--project <name>` - Project name (required)
+- `--task-id <id>` - Override or attach a Mission Control task ID
+- `--background` - Resume in a tracked detached process
+- `--force` - Bypass the duplicate-run guard for the project
 
 **Execution mode:** `codex-resume` always runs Codex with `-a never exec --sandbox workspace-write resume`
 
-**Auto-finds** the last session ID from registry and continues with output rotation.
+**Auto-finds** the last session ID from registry and continues with output rotation. Tracked task resumes stay on the same task branch.
 
 ### codex-status
 
@@ -111,6 +140,9 @@ Check session status and view output.
 ```bash
 # Check status
 codex-status --project <folder_name>
+
+# Check status as JSON
+codex-status --project <folder_name> --json
 
 # View output
 codex-status --project <folder_name> --output
@@ -124,6 +156,9 @@ codex-status --project <folder_name> --history
 # Kill stuck session
 codex-status --project <folder_name> --kill
 ```
+
+`--json` is the preferred mode for agents that need to decide whether Codex is active, quiet, resumable, or completed.
+It also reports the current git branch, tracked branch, and whether they match.
 
 ## Workflow
 
@@ -160,6 +195,22 @@ codex-do --project "Mission Control UI" "..."  # <-- NO! Use folder name
 
 ### 2. Starting Work
 
+### 2. Task Branches
+
+For Mission Control task work, create or switch to the task branch first:
+
+```bash
+codex-branch --project mission_control_ui --task-id k176w64p843g1brae8zmqys6qs820knf
+```
+
+Rules:
+- task branch name is the full task ID
+- continue reopened tasks on the same branch
+- do not mix multiple tasks on the same branch
+- if the repo is dirty on another branch, stop and clean it up before switching tasks
+
+### 3. Starting Work
+
 Always provide **specific, actionable prompts**:
 
 ```bash
@@ -174,11 +225,30 @@ codex-do --project mission_control_ui "Create a TaskCard component with:
 codex-do --project mission_control_ui "Build the UI"
 ```
 
-### 3. Monitoring Progress
+### 3a. Cron-Managed Pattern
+
+For unattended task execution:
+
+1. `codex-branch --project <folder> --task-id <task-id>`
+2. `codex-status --project <folder> --json`
+3. If `process_running=true` and `productive=true`, leave the session alone
+4. If `resumable=true`, use `codex-resume`
+5. If no tracked run exists, start one with:
+
+```bash
+codex-do --project mission_control_ui --task-id <task-id> --background "Implement the assigned task"
+```
+
+Do not launch raw `codex exec` or ad hoc background Codex from a cron-managed agent loop.
+
+### 4. Monitoring Progress
 
 Check status:
 ```bash
-# Quick status (shows all output files)
+# Quick machine-readable status
+codex-status --project mission_control_ui --json
+
+# Human-readable summary
 codex-status --project mission_control_ui
 
 # View iteration history
@@ -202,7 +272,7 @@ This preserves history without manual cleanup.
 
 If Codex asks questions mid-session:
 1. Check output: `codex-status --project X --output`
-2. Answer via resume: `codex-resume --project X "Answer: yes"`
+2. Answer via resume: `codex-resume --project X --background "Answer: yes"`
 
 ### 6. Completion
 
@@ -228,6 +298,7 @@ Use the wrapper's only supported mode:
 
 1. `codex-do`: `-a never exec --sandbox workspace-write`
 2. `codex-resume`: `-a never exec --sandbox workspace-write resume`
+3. Detached work should go through `--background`, not raw shell backgrounding
 
 ### Never Do This
 
@@ -235,6 +306,7 @@ Use the wrapper's only supported mode:
 - ❌ Run Codex in `~/clawd/` or system directories
 - ❌ Ignore error messages in output
 - ❌ Commit without reviewing changes
+- ❌ Launch a second Codex run into the same repo without checking `codex-status --json`
 
 ### Always Do This
 

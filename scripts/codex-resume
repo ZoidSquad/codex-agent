@@ -46,6 +46,7 @@ fi
 
 AGENT_NAME="${DETECTED_AGENT:-Agent}"
 export AGENT_NAME
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 CODE_BASE="/home/dan/zoidcode"
 
@@ -68,6 +69,9 @@ ITERATIONS_FILE="$MEMORY_DIR/codex-iterations.json"
 PROJECT=""
 PROMPT=""
 MODE="workspace-write"
+BACKGROUND=false
+FORCE=false
+TASK_ID=""
 
 # ============================================================================
 # DEPENDENCY CHECKS
@@ -99,6 +103,18 @@ while [[ $# -gt 0 ]]; do
       PROJECT="$2"
       shift 2
       ;;
+    --task-id)
+      TASK_ID="$2"
+      shift 2
+      ;;
+    --background)
+      BACKGROUND=true
+      shift
+      ;;
+    --force)
+      FORCE=true
+      shift
+      ;;
     --full-auto)
       echo "Warning: --full-auto is no longer needed; codex-resume already uses unattended workspace-write sandbox mode." >&2
       shift
@@ -122,6 +138,13 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --project <name>   Project name (required)"
+      echo "  --task-id <id>     Mission Control task ID to track with the session"
+      echo "  --background       Launch resume in a tracked detached process"
+      echo "  --force            Resume even if another Codex run is already active for the project"
+      echo ""
+      echo "Tracked task workflow:"
+      echo "  Use 'codex-branch --project <name> --task-id <id>' before resuming task-bound work."
+      echo "  Tracked task work must stay on the branch named exactly like the task ID."
       echo "  --help            Show this help"
       exit 0
       ;;
@@ -153,7 +176,7 @@ if [[ ! -f "$SESSIONS_FILE" ]]; then
 fi
 
 # Get session info from registry
-SESSION_DATA=$(jq -r ".[$PROJECT] // empty" "$SESSIONS_FILE" 2>/dev/null || echo "")
+SESSION_DATA=$(jq -c --arg project "$PROJECT" '.[$project] // empty' "$SESSIONS_FILE" 2>/dev/null || echo "")
 
 if [[ -z "$SESSION_DATA" || "$SESSION_DATA" == "null" ]]; then
   echo "Error: No session found for project '$PROJECT'" >&2
@@ -174,10 +197,155 @@ fi
 # Setup paths
 PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+SESSION_TRACKER="$ZOID_DIR/session.json"
+TRACKED_TASK_ID=""
+TRACKED_BRANCH=""
+CURRENT_BRANCH=""
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "Error: Project directory not found: $PROJECT_DIR" >&2
   exit 1
+fi
+
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\/]/\\&/g'
+}
+
+build_codex_process_pattern() {
+  local escaped_output
+  escaped_output=$(escape_regex "$OUTPUT_FILE")
+  printf '(^|/)codex( |$).*-o[[:space:]]+%s([[:space:]]|$)' "$escaped_output"
+}
+
+get_current_branch() {
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+load_tracked_metadata() {
+  if [[ ! -f "$SESSION_TRACKER" ]]; then
+    return 0
+  fi
+
+  TRACKED_TASK_ID=$(jq -r '.task_id // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+  TRACKED_BRANCH=$(jq -r '.branch // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+}
+
+ensure_task_branch_ready() {
+  local expected_branch
+
+  load_tracked_metadata
+
+  if [[ -n "$TASK_ID" && -n "$TRACKED_TASK_ID" && "$TASK_ID" != "$TRACKED_TASK_ID" ]]; then
+    echo "Error: Requested task '$TASK_ID' does not match tracked task '$TRACKED_TASK_ID' for project '$PROJECT'." >&2
+    echo "Resume the existing task or start a new Codex session on the correct task branch." >&2
+    exit 1
+  fi
+
+  if [[ -z "$TASK_ID" && -n "$TRACKED_TASK_ID" ]]; then
+    TASK_ID="$TRACKED_TASK_ID"
+  fi
+
+  expected_branch="$TRACKED_BRANCH"
+  if [[ -z "$expected_branch" && -n "$TASK_ID" ]]; then
+    expected_branch="$TASK_ID"
+  fi
+
+  [[ -z "$expected_branch" ]] && return 0
+
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Error: Tracked task work requires a git repository at $PROJECT_DIR." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $expected_branch' before resuming tracked work." >&2
+    exit 1
+  fi
+
+  CURRENT_BRANCH=$(get_current_branch)
+  if [[ -z "$CURRENT_BRANCH" || "$CURRENT_BRANCH" == "HEAD" ]]; then
+    echo "Error: Could not determine the current git branch for $PROJECT_DIR." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $expected_branch' before resuming tracked work." >&2
+    exit 1
+  fi
+
+  if [[ "$CURRENT_BRANCH" != "$expected_branch" ]]; then
+    echo "Error: Current branch '$CURRENT_BRANCH' does not match tracked task branch '$expected_branch'." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $expected_branch' before resuming tracked work." >&2
+    exit 1
+  fi
+}
+
+ensure_no_existing_run() {
+  local process_pattern running_pids existing_task_id existing_branch
+
+  [[ "$FORCE" == true ]] && return 0
+
+  process_pattern=$(build_codex_process_pattern)
+  running_pids=$(pgrep -f "$process_pattern" 2>/dev/null || true)
+  if [[ -z "$running_pids" ]]; then
+    return 0
+  fi
+
+  existing_task_id=""
+  existing_branch=""
+  if [[ -f "$SESSION_TRACKER" ]]; then
+    existing_task_id=$(jq -r '.task_id // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+    existing_branch=$(jq -r '.branch // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+  fi
+
+  echo "Error: Codex is already running for project '$PROJECT'." >&2
+  echo "Use 'codex-status --project $PROJECT --json' to inspect the current session." >&2
+  if [[ -n "$existing_task_id" ]]; then
+    echo "Tracked task: $existing_task_id" >&2
+  fi
+  if [[ -n "$existing_branch" ]]; then
+    echo "Tracked branch: $existing_branch" >&2
+  fi
+  echo "Use --force only if you intentionally want overlapping work in the same repo." >&2
+  exit 1
+}
+
+launch_background_resume() {
+  local child_args=()
+  local background_pid
+
+  mkdir -p "$ZOID_DIR"
+
+  child_args+=(--project "$PROJECT")
+  [[ -n "$TASK_ID" ]] && child_args+=(--task-id "$TASK_ID")
+  child_args+=("$PROMPT")
+
+  nohup env \
+    AGENT_NAME="$AGENT_NAME" \
+    OPENCLAW_WORKSPACE="$WORKSPACE_DIR" \
+    CODEX_LAUNCH_MODE="background" \
+    "$SCRIPT_PATH" "${child_args[@]}" >/dev/null 2>&1 &
+  background_pid=$!
+
+  sleep 1
+  if ! kill -0 "$background_pid" 2>/dev/null; then
+    echo "Error: background Codex resume launcher exited before the session stabilized." >&2
+    echo "Inspect $PROJECT_DIR/.zoid/ and rerun with 'codex-status --project $PROJECT --json'." >&2
+    exit 1
+  fi
+
+  echo "Started background Codex resume for $PROJECT."
+  echo "Launcher PID: $background_pid"
+  [[ -n "$TASK_ID" ]] && echo "Task ID: $TASK_ID"
+  echo ""
+  echo "Next steps:"
+  echo "  codex-status --project $PROJECT --json"
+  echo "  codex-status --project $PROJECT --output"
+  exit 0
+}
+
+ensure_task_branch_ready
+ensure_no_existing_run
+
+if [[ "$BACKGROUND" == true ]]; then
+  launch_background_resume
 fi
 
 # Rotate output files before resuming
@@ -214,6 +382,7 @@ CODEX_FLAGS="$CODEX_FLAGS -o $OUTPUT_FILE"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Resume: $AGENT_NAME"
 echo "  Project: $PROJECT"
+[[ -n "$CURRENT_BRANCH" ]] && echo "  Branch: $CURRENT_BRANCH"
 echo "  Last Status: $LAST_STATUS"
 echo "  Session: $SESSION_ID"
 echo "═══════════════════════════════════════════════════════════════"
@@ -233,19 +402,21 @@ cat > "$ITERATION_FILE" << EOF
   "local_session_id": "$NEW_LOCAL_SESSION",
   "codex_session_id": "$SESSION_ID",
   "timestamp": "$(date -Iseconds)",
-  "prompt": $(echo "$PROMPT" | jq -R -s .),
+  "prompt": $(printf '%s' "$PROMPT" | jq -R -s .),
   "mode": "$MODE"
 }
 EOF
 
 # Update session tracker
-SESSION_TRACKER="$ZOID_DIR/session.json"
 if [[ -f "$SESSION_TRACKER" ]]; then
-  jq --arg local_sid "$NEW_LOCAL_SESSION" --arg prompt "$PROMPT" '
+  jq --arg local_sid "$NEW_LOCAL_SESSION" --arg prompt "$PROMPT" --arg task_id "$TASK_ID" --arg branch "$CURRENT_BRANCH" --arg launch_mode "${CODEX_LAUNCH_MODE:-foreground}" '
     .local_session_id = $local_sid |
     .status = "running" |
     .resumed_at = "'"$(date -Iseconds)"'" |
-    .resume_prompt = $prompt
+    .resume_prompt = $prompt |
+    .launch_mode = $launch_mode |
+    .task_id = (if $task_id == "" then .task_id else $task_id end) |
+    .branch = (if $branch == "" then .branch else $branch end)
   ' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
 fi
 
@@ -282,7 +453,7 @@ fi
 
 # Log skill usage
 if [[ "$HAS_CLAWD" == true && $EXIT_CODE -eq 0 ]]; then
-  short_prompt=$(echo "$PROMPT" | cut -c1-80)
+  short_prompt=$(printf '%s' "$PROMPT" | cut -c1-80)
   [[ ${#PROMPT} -gt 80 ]] && short_prompt="${short_prompt}..."
   clawd skill used "codex-agent" "Resume project: $PROJECT - $short_prompt" 2>/dev/null || true
 fi

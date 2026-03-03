@@ -67,6 +67,7 @@ SHOW_OUTPUT=false
 FOLLOW=false
 KILL=false
 LIST_HISTORY=false
+JSON_OUTPUT=false
 LIMIT=50
 
 # ============================================================================
@@ -96,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       LIST_HISTORY=true
       shift
       ;;
+    --json)
+      JSON_OUTPUT=true
+      shift
+      ;;
     --limit|-n)
       LIMIT="$2"
       shift 2
@@ -109,6 +114,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --follow, -f       Follow output (like tail -f)"
       echo "  --kill, -k         Kill running session"
       echo "  --history, -H      Show iteration history"
+      echo "  --json             Output machine-readable status"
       echo "  --limit <n>, -n    Limit output to N lines (default: 50)"
       echo "  --help, -h         Show this help"
       exit 0
@@ -126,6 +132,11 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
+if [[ "$JSON_OUTPUT" == true && ( "$SHOW_OUTPUT" == true || "$FOLLOW" == true || "$KILL" == true || "$LIST_HISTORY" == true ) ]]; then
+  echo "Error: --json cannot be combined with --output, --follow, --kill, or --history" >&2
+  exit 1
+fi
+
 # Normalize project name
 PROJECT=$(basename "$PROJECT")
 
@@ -134,6 +145,9 @@ PROJECT_DIR="$CODE_BASE/$PROJECT"
 ZOID_DIR="$PROJECT_DIR/.zoid"
 OUTPUT_FILE="$ZOID_DIR/output.txt"
 SESSION_TRACKER="$ZOID_DIR/session.json"
+GIT_BRANCH=""
+TRACKED_BRANCH=""
+GIT_DIRTY=false
 
 escape_regex() {
   printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\/]/\\&/g'
@@ -145,11 +159,32 @@ build_codex_process_pattern() {
   printf '(^|/)codex( |$).*-o[[:space:]]+%s([[:space:]]|$)' "$escaped_output"
 }
 
+get_current_branch() {
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+git_dirty() {
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 1
+  fi
+
+  [[ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]]
+}
+
 # Check if project exists
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "Error: Project not found: $PROJECT" >&2
   echo "Expected: $PROJECT_DIR" >&2
   exit 1
+fi
+
+GIT_BRANCH=$(get_current_branch)
+if git_dirty; then
+  GIT_DIRTY=true
 fi
 
 # ============================================================================
@@ -194,7 +229,7 @@ if [[ "$LIST_HISTORY" == true ]]; then
   echo "═══════════════════════════════════════════════════════════════"
   
   if [[ -f "$ITERATIONS_FILE" ]]; then
-    ITERATIONS=$(jq -r ".$PROJECT // []" "$ITERATIONS_FILE" 2>/dev/null || echo "[]")
+    ITERATIONS=$(jq -c --arg project "$PROJECT" '.[$project] // []' "$ITERATIONS_FILE" 2>/dev/null || echo "[]")
     COUNT=$(echo "$ITERATIONS" | jq 'length')
     
     if [[ "$COUNT" -eq 0 ]]; then
@@ -224,43 +259,220 @@ fi
 # STATUS DISPLAY
 # ============================================================================
 
+TRACKER_PRESENT=false
+TRACKER_STATUS="unknown"
+STATUS="unknown"
+SESSION_ID="unknown"
+LOCAL_SESSION_ID="unknown"
+TASK_ID=""
+STARTED="unknown"
+COMPLETED="N/A"
+EXIT_CODE="N/A"
+LAUNCH_MODE="unknown"
+
+if [[ -f "$SESSION_TRACKER" ]]; then
+  TRACKER_PRESENT=true
+  TRACKER_STATUS=$(jq -r '.status // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  STATUS="$TRACKER_STATUS"
+  SESSION_ID=$(jq -r '.session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  LOCAL_SESSION_ID=$(jq -r '.local_session_id // .session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  TASK_ID=$(jq -r '.task_id // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+  TRACKED_BRANCH=$(jq -r '.branch // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+  STARTED=$(jq -r '.started_at // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+  COMPLETED=$(jq -r '.completed_at // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
+  EXIT_CODE=$(jq -r '.exit_code // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
+  LAUNCH_MODE=$(jq -r '.launch_mode // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
+fi
+
+[[ -z "$SESSION_ID" ]] && SESSION_ID="unknown"
+[[ -z "$LOCAL_SESSION_ID" ]] && LOCAL_SESSION_ID="unknown"
+[[ -z "$STARTED" ]] && STARTED="unknown"
+[[ -z "$COMPLETED" ]] && COMPLETED="N/A"
+[[ -z "$EXIT_CODE" ]] && EXIT_CODE="N/A"
+[[ -z "$LAUNCH_MODE" ]] && LAUNCH_MODE="unknown"
+
+PROCESS_PATTERN=$(build_codex_process_pattern)
+RUNNING_PIDS=$(pgrep -f "$PROCESS_PATTERN" 2>/dev/null || true)
+PROCESS_RUNNING=false
+if [[ -n "$RUNNING_PIDS" ]]; then
+  PROCESS_RUNNING=true
+  STATUS="running"
+fi
+
+OUTPUT_EXISTS=false
+OUTPUT_AGE_SECONDS=""
+OUTPUT_BYTES=""
+if [[ -f "$OUTPUT_FILE" ]]; then
+  OUTPUT_EXISTS=true
+  OUTPUT_MTIME=$(stat -c %Y "$OUTPUT_FILE" 2>/dev/null || echo "")
+  OUTPUT_BYTES=$(stat -c %s "$OUTPUT_FILE" 2>/dev/null || echo "")
+  if [[ -n "$OUTPUT_MTIME" ]]; then
+    NOW_EPOCH=$(date +%s)
+    OUTPUT_AGE_SECONDS=$((NOW_EPOCH - OUTPUT_MTIME))
+  fi
+fi
+
+ACTIVITY_STATE="unknown"
+PRODUCTIVE=false
+RESUMABLE=false
+if [[ "$PROCESS_RUNNING" == true ]]; then
+  if [[ "$OUTPUT_EXISTS" == true && -n "$OUTPUT_AGE_SECONDS" ]]; then
+    if (( OUTPUT_AGE_SECONDS <= 300 )); then
+      ACTIVITY_STATE="active"
+      PRODUCTIVE=true
+    else
+      ACTIVITY_STATE="quiet"
+    fi
+  else
+    ACTIVITY_STATE="starting"
+  fi
+elif [[ "$STATUS" == "completed" ]]; then
+  ACTIVITY_STATE="completed"
+elif [[ "$STATUS" == "failed" ]]; then
+  ACTIVITY_STATE="failed"
+  [[ "$SESSION_ID" != "unknown" && "$SESSION_ID" != "null" ]] && RESUMABLE=true
+elif [[ "$STATUS" == "timeout" || "$STATUS" == "killed" ]]; then
+  ACTIVITY_STATE="$STATUS"
+  [[ "$SESSION_ID" != "unknown" && "$SESSION_ID" != "null" ]] && RESUMABLE=true
+elif [[ "$TRACKER_PRESENT" == true ]]; then
+  ACTIVITY_STATE="stopped"
+  [[ "$SESSION_ID" != "unknown" && "$SESSION_ID" != "null" ]] && RESUMABLE=true
+else
+  ACTIVITY_STATE="unknown"
+fi
+
+if [[ "$JSON_OUTPUT" == true ]]; then
+  if [[ -n "$RUNNING_PIDS" ]]; then
+    PIDS_JSON=$(printf '%s\n' "$RUNNING_PIDS" | sed '/^$/d' | jq -R . | jq -s .)
+  else
+    PIDS_JSON='[]'
+  fi
+
+  if [[ -n "$OUTPUT_AGE_SECONDS" ]]; then
+    OUTPUT_AGE_JSON="$OUTPUT_AGE_SECONDS"
+  else
+    OUTPUT_AGE_JSON="null"
+  fi
+
+  if [[ -n "$OUTPUT_BYTES" ]]; then
+    OUTPUT_BYTES_JSON="$OUTPUT_BYTES"
+  else
+    OUTPUT_BYTES_JSON="null"
+  fi
+
+  if [[ "$EXIT_CODE" == "N/A" || "$EXIT_CODE" == "unknown" ]]; then
+    EXIT_CODE_JSON="null"
+  else
+    EXIT_CODE_JSON="$EXIT_CODE"
+  fi
+
+  if [[ -n "$GIT_BRANCH" ]]; then
+    GIT_BRANCH_JSON=$(printf '%s' "$GIT_BRANCH" | jq -R .)
+  else
+    GIT_BRANCH_JSON="null"
+  fi
+
+  if [[ -n "$TRACKED_BRANCH" ]]; then
+    TRACKED_BRANCH_JSON=$(printf '%s' "$TRACKED_BRANCH" | jq -R .)
+  else
+    TRACKED_BRANCH_JSON="null"
+  fi
+
+  if [[ -n "$GIT_BRANCH" && -n "$TRACKED_BRANCH" ]]; then
+    if [[ "$GIT_BRANCH" == "$TRACKED_BRANCH" ]]; then
+      BRANCH_MATCH_JSON=true
+    else
+      BRANCH_MATCH_JSON=false
+    fi
+  else
+    BRANCH_MATCH_JSON="null"
+  fi
+
+  jq -n \
+    --arg project "$PROJECT" \
+    --arg directory "$PROJECT_DIR" \
+    --arg status "$STATUS" \
+    --arg tracker_status "$TRACKER_STATUS" \
+    --arg activity_state "$ACTIVITY_STATE" \
+    --arg session_id "$SESSION_ID" \
+    --arg local_session_id "$LOCAL_SESSION_ID" \
+    --arg task_id "$TASK_ID" \
+    --arg started_at "$STARTED" \
+    --arg completed_at "$COMPLETED" \
+    --arg launch_mode "$LAUNCH_MODE" \
+    --arg output_file "$OUTPUT_FILE" \
+    --argjson tracker_present "$TRACKER_PRESENT" \
+    --argjson process_running "$PROCESS_RUNNING" \
+    --argjson productive "$PRODUCTIVE" \
+    --argjson resumable "$RESUMABLE" \
+    --argjson output_exists "$OUTPUT_EXISTS" \
+    --argjson output_age_seconds "$OUTPUT_AGE_JSON" \
+    --argjson output_bytes "$OUTPUT_BYTES_JSON" \
+    --argjson exit_code "$EXIT_CODE_JSON" \
+    --argjson pids "$PIDS_JSON" \
+    --argjson git_branch "$GIT_BRANCH_JSON" \
+    --argjson tracked_branch "$TRACKED_BRANCH_JSON" \
+    --argjson branch_match "$BRANCH_MATCH_JSON" \
+    --argjson git_dirty "$GIT_DIRTY" '
+    {
+      project: $project,
+      directory: $directory,
+      status: $status,
+      tracker_status: $tracker_status,
+      activity_state: $activity_state,
+      tracker_present: $tracker_present,
+      process_running: $process_running,
+      productive: $productive,
+      resumable: $resumable,
+      session_id: (if $session_id == "unknown" or $session_id == "null" then null else $session_id end),
+      local_session_id: (if $local_session_id == "unknown" or $local_session_id == "null" then null else $local_session_id end),
+      task_id: (if $task_id == "" or $task_id == "null" then null else $task_id end),
+      started_at: (if $started_at == "unknown" then null else $started_at end),
+      completed_at: (if $completed_at == "N/A" or $completed_at == "unknown" then null else $completed_at end),
+      exit_code: $exit_code,
+      launch_mode: (if $launch_mode == "unknown" then null else $launch_mode end),
+      git_branch: $git_branch,
+      tracked_branch: $tracked_branch,
+      branch_match: $branch_match,
+      git_dirty: $git_dirty,
+      output: {
+        file: $output_file,
+        exists: $output_exists,
+        age_seconds: $output_age_seconds,
+        size_bytes: $output_bytes
+      },
+      pids: $pids
+    }'
+  exit 0
+fi
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Status: $PROJECT"
 echo "═══════════════════════════════════════════════════════════════"
 
-# Load tracker info
-if [[ -f "$SESSION_TRACKER" ]]; then
-  STATUS=$(jq -r '.status // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
-  SESSION_ID=$(jq -r '.session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
-  LOCAL_SESSION_ID=$(jq -r '.local_session_id // .session_id // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
-  STARTED=$(jq -r '.started_at // "unknown"' "$SESSION_TRACKER" 2>/dev/null || echo "unknown")
-  COMPLETED=$(jq -r '.completed_at // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
-  EXIT_CODE=$(jq -r '.exit_code // "N/A"' "$SESSION_TRACKER" 2>/dev/null || echo "N/A")
-  
+if [[ "$TRACKER_PRESENT" == true ]]; then
   echo "  Local Session: $LOCAL_SESSION_ID"
   echo "  Codex Session: $SESSION_ID"
+  [[ -n "$TASK_ID" ]] && echo "  Task ID: $TASK_ID"
+  [[ -n "$TRACKED_BRANCH" ]] && echo "  Tracked Branch: $TRACKED_BRANCH"
   echo "  Status: $STATUS"
+  echo "  Activity: $ACTIVITY_STATE"
   [[ "$EXIT_CODE" != "N/A" ]] && echo "  Exit Code: $EXIT_CODE"
   echo "  Started: $STARTED"
   [[ "$COMPLETED" != "N/A" ]] && echo "  Completed: $COMPLETED"
 else
   echo "  No session tracker found"
-  STATUS="unknown"
 fi
 
-# Check for running processes by the output file path passed to Codex.
-PROCESS_PATTERN=$(build_codex_process_pattern)
-RUNNING_PIDS=$(pgrep -f "$PROCESS_PATTERN" || echo "")
-if [[ -n "$RUNNING_PIDS" ]]; then
+if [[ "$PROCESS_RUNNING" == true ]]; then
   echo "  Process: running (PIDs: $(echo "$RUNNING_PIDS" | tr '\n' ' '))"
-  if [[ "$STATUS" == "completed" || "$STATUS" == "unknown" ]]; then
-    STATUS="running"
-  fi
 else
   echo "  Process: not running"
 fi
+if [[ "$OUTPUT_EXISTS" == true && -n "$OUTPUT_AGE_SECONDS" ]]; then
+  echo "  Output age: ${OUTPUT_AGE_SECONDS}s"
+fi
 
-# Show available output files
 if [[ -d "$ZOID_DIR" ]]; then
   OUTPUT_FILES=$(find "$ZOID_DIR" -name "output*.txt" -type f 2>/dev/null | sort -r)
   if [[ -n "$OUTPUT_FILES" ]]; then
@@ -273,10 +485,11 @@ if [[ -d "$ZOID_DIR" ]]; then
   fi
 fi
 
-# Show project info
 echo ""
 echo "  Directory: $PROJECT_DIR"
 echo "  Git repo: $([[ -d "$PROJECT_DIR/.git" ]] && echo "yes" || echo "no")"
+[[ -n "$GIT_BRANCH" ]] && echo "  Current branch: $GIT_BRANCH"
+echo "  Git dirty: $([[ "$GIT_DIRTY" == true ]] && echo "yes" || echo "no")"
 
 if [[ -d "$PROJECT_DIR/.git" ]]; then
   cd "$PROJECT_DIR"

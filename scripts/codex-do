@@ -50,6 +50,7 @@ fi
 
 AGENT_NAME="${DETECTED_AGENT:-Agent}"
 export AGENT_NAME
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 # Code lives in zoidcode (shared across all agents)
 CODE_BASE="/home/dan/zoidcode"
@@ -114,7 +115,10 @@ fi
 PROJECT=""
 DRY_RUN=false
 SUGGEST_CMD=false
-TIMEOUT=30
+BACKGROUND=false
+FORCE=false
+TASK_ID=""
+TIMEOUT=0
 VALIDATE_PROJECT=true
 PROMPT=""
 
@@ -137,6 +141,18 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=true
       shift
       ;;
+    --background)
+      BACKGROUND=true
+      shift
+      ;;
+    --force)
+      FORCE=true
+      shift
+      ;;
+    --task-id)
+      TASK_ID="$2"
+      shift 2
+      ;;
     --suggest-cmd)
       SUGGEST_CMD=true
       shift
@@ -156,11 +172,18 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --project <name>   Project slug (required)"
+      echo "  --task-id <id>     Mission Control task ID to track with the session"
+      echo "  --background       Launch Codex in a tracked detached process"
       echo "  --dry-run         Show what would execute"
+      echo "  --force           Start even if another Codex run is already active for the project"
       echo "  --suggest-cmd     Output OpenClaw exec command for background mode"
       echo "  --no-validate     Skip Mission Control project validation"
-      echo "  --timeout <min>   Kill after N minutes (0 = no timeout, default: 30)"
+      echo "  --timeout <min>   Kill after N minutes (0 = no timeout, default: 0)"
       echo "  --help            Show this help"
+      echo ""
+      echo "Tracked task workflow:"
+      echo "  Prepare the task branch first with 'codex-branch --project <name> --task-id <id>'."
+      echo "  Tracked task work must run on the branch named exactly like the task ID."
       echo ""
       echo "Environment:"
       echo "  AGENT_NAME        Override detected agent name"
@@ -188,6 +211,11 @@ fi
 
 # Normalize project name
 PROJECT=$(basename "$PROJECT")
+PROJECT_DIR="$CODE_BASE/$PROJECT"
+ZOID_DIR="$PROJECT_DIR/.zoid"
+OUTPUT_FILE="$ZOID_DIR/output.txt"
+SESSION_TRACKER="$ZOID_DIR/session.json"
+CURRENT_BRANCH=""
 
 # ============================================================================
 # MISSION CONTROL VALIDATION
@@ -214,6 +242,124 @@ validate_project_in_mc() {
 
 validate_project_in_mc
 
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\/]/\\&/g'
+}
+
+build_codex_process_pattern() {
+  local escaped_output
+  escaped_output=$(escape_regex "$OUTPUT_FILE")
+  printf '(^|/)codex( |$).*-o[[:space:]]+%s([[:space:]]|$)' "$escaped_output"
+}
+
+get_current_branch() {
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+ensure_task_branch_ready() {
+  local expected_branch
+
+  [[ -z "$TASK_ID" ]] && return 0
+
+  if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Error: Tracked task work requires a git repository at $PROJECT_DIR." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $TASK_ID' before starting tracked work." >&2
+    exit 1
+  fi
+
+  CURRENT_BRANCH=$(get_current_branch)
+  expected_branch="$TASK_ID"
+
+  if [[ -z "$CURRENT_BRANCH" || "$CURRENT_BRANCH" == "HEAD" ]]; then
+    echo "Error: Could not determine the current git branch for $PROJECT_DIR." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $TASK_ID' before starting tracked work." >&2
+    exit 1
+  fi
+
+  if [[ "$CURRENT_BRANCH" != "$expected_branch" ]]; then
+    echo "Error: Current branch '$CURRENT_BRANCH' does not match task branch '$expected_branch'." >&2
+    echo "Run 'codex-branch --project $PROJECT --task-id $TASK_ID' before starting tracked work." >&2
+    exit 1
+  fi
+}
+
+find_running_pids() {
+  local process_pattern
+  process_pattern=$(build_codex_process_pattern)
+  pgrep -f "$process_pattern" 2>/dev/null || true
+}
+
+ensure_no_existing_run() {
+  local running_pids existing_task_id existing_branch
+
+  [[ "$FORCE" == true ]] && return 0
+
+  running_pids=$(find_running_pids)
+  if [[ -z "$running_pids" ]]; then
+    return 0
+  fi
+
+  existing_task_id=""
+  existing_branch=""
+  if [[ -f "$SESSION_TRACKER" ]]; then
+    existing_task_id=$(jq -r '.task_id // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+    existing_branch=$(jq -r '.branch // empty' "$SESSION_TRACKER" 2>/dev/null || true)
+  fi
+
+  echo "Error: Codex is already running for project '$PROJECT'." >&2
+  echo "Use 'codex-status --project $PROJECT --json' to inspect the current session." >&2
+  if [[ -n "$existing_task_id" ]]; then
+    echo "Tracked task: $existing_task_id" >&2
+  fi
+  if [[ -n "$existing_branch" ]]; then
+    echo "Tracked branch: $existing_branch" >&2
+  fi
+  echo "Use --force only if you intentionally want overlapping work in the same repo." >&2
+  exit 1
+}
+
+launch_background_child() {
+  local child_args=()
+  local background_pid
+
+  mkdir -p "$PROJECT_DIR" "$ZOID_DIR" "$MEMORY_DIR"
+
+  child_args+=(--project "$PROJECT")
+  child_args+=(--no-validate)
+  child_args+=(--timeout "$TIMEOUT")
+  [[ -n "$TASK_ID" ]] && child_args+=(--task-id "$TASK_ID")
+  child_args+=("$PROMPT")
+
+  nohup env \
+    AGENT_NAME="$AGENT_NAME" \
+    OPENCLAW_WORKSPACE="$WORKSPACE_DIR" \
+    CODEX_LAUNCH_MODE="background" \
+    "$SCRIPT_PATH" "${child_args[@]}" >/dev/null 2>&1 &
+  background_pid=$!
+
+  sleep 1
+  if ! kill -0 "$background_pid" 2>/dev/null; then
+    echo "Error: background Codex launcher exited before the session stabilized." >&2
+    echo "Inspect $PROJECT_DIR/.zoid/ and rerun with 'codex-status --project $PROJECT --json'." >&2
+    exit 1
+  fi
+
+  echo "Started background Codex launcher for $PROJECT."
+  echo "Launcher PID: $background_pid"
+  [[ -n "$TASK_ID" ]] && echo "Task ID: $TASK_ID"
+  echo ""
+  echo "Next steps:"
+  echo "  codex-status --project $PROJECT --json"
+  echo "  codex-status --project $PROJECT --output"
+  exit 0
+}
+
+ensure_task_branch_ready
+
 # ============================================================================
 # SUGGEST-CMD MODE
 # ============================================================================
@@ -233,7 +379,7 @@ if [[ "$SUGGEST_CMD" == true ]]; then
   echo ""
   echo "exec pty:true background:true workdir:$PROJECT_DIR \\"
   echo "  command:\"codex $SUGGEST_FLAGS -o .zoid/output.txt \\"
-  echo "    $(echo "$PROMPT" | jq -R -s . | sed 's/\\"/\\\\\\"/g')\""
+  echo "    $(printf '%s' "$PROMPT" | jq -R -s . | sed 's/\\"/\\\\\\"/g')\""
   echo ""
   echo "═══════════════════════════════════════════════════════════════"
   echo ""
@@ -247,10 +393,6 @@ fi
 # ============================================================================
 # EXECUTION PATHS
 # ============================================================================
-
-PROJECT_DIR="$CODE_BASE/$PROJECT"
-ZOID_DIR="$PROJECT_DIR/.zoid"
-OUTPUT_FILE="$ZOID_DIR/output.txt"
 
 # Build codex flags for the single supported execution mode.
 CODEX_FLAGS="-a never exec --sandbox workspace-write"
@@ -267,13 +409,19 @@ else
   TIMEOUT_DISPLAY="${TIMEOUT} minutes"
 fi
 
+if [[ "$DRY_RUN" != true && "$SUGGEST_CMD" != true ]]; then
+  ensure_no_existing_run
+fi
+
 MODE_LABEL="Unattended workspace-write sandbox"
+[[ "$BACKGROUND" == true ]] && MODE_LABEL="Detached tracked workspace-write sandbox"
 
 # Show what we're doing before deciding whether to execute or only preview.
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Codex Agent: $AGENT_NAME"
 echo "  Project: $PROJECT"
 echo "  Directory: $PROJECT_DIR"
+[[ -n "$CURRENT_BRANCH" ]] && echo "  Branch: $CURRENT_BRANCH"
 echo "  Timeout: $TIMEOUT_DISPLAY"
 echo "  Mode: $MODE_LABEL"
 echo "═══════════════════════════════════════════════════════════════"
@@ -284,9 +432,18 @@ echo ""
 
 if [[ "$DRY_RUN" == true ]]; then
   echo "[DRY RUN] Would execute:"
-  echo "  cd $PROJECT_DIR"
-  echo "  $TIMEOUT_CMD codex $CODEX_FLAGS $(echo "$PROMPT" | jq -R -s .)"
+  if [[ "$BACKGROUND" == true ]]; then
+    echo "  nohup env AGENT_NAME=$AGENT_NAME OPENCLAW_WORKSPACE=$WORKSPACE_DIR \\"
+    echo "    $SCRIPT_PATH --project $PROJECT --no-validate --timeout $TIMEOUT${TASK_ID:+ --task-id $TASK_ID} $(printf '%s' "$PROMPT" | jq -R -s .) >/dev/null 2>&1 &"
+  else
+    echo "  cd $PROJECT_DIR"
+    echo "  $TIMEOUT_CMD codex $CODEX_FLAGS $(printf '%s' "$PROMPT" | jq -R -s .)"
+  fi
   exit 0
+fi
+
+if [[ "$BACKGROUND" == true ]]; then
+  launch_background_child
 fi
 
 # ============================================================================
@@ -382,6 +539,10 @@ EOF
 
 init_git_repo
 
+if [[ -z "$CURRENT_BRANCH" ]]; then
+  CURRENT_BRANCH=$(get_current_branch)
+fi
+
 # ============================================================================
 # SESSION REGISTRY HELPERS (with locking)
 # ============================================================================
@@ -391,37 +552,44 @@ update_sessions_registry() {
   local project="$1"
   local session_id="$2"
   local tracker_data="$3"
-  
-  local update_cmd="
-    import json, sys
-    data = json.load(sys.stdin)
-    data['$project'] = {
-      'current_session': '$session_id',
-      'last_updated': '$(date -Iseconds)',
-      'tracker': $tracker_data
-    }
-    
-    # Keep only last $MAX_SESSIONS_PER_PROJECT projects to prevent bloat
-    if len(data) > $MAX_SESSIONS_PER_PROJECT:
-      # Sort by last_updated and keep most recent
-      sorted_items = sorted(
+
+  local update_cmd
+  read -r -d '' update_cmd <<'PY' || true
+import json
+import sys
+
+project = sys.argv[1]
+session_id = sys.argv[2]
+tracker = json.loads(sys.argv[3])
+max_sessions = int(sys.argv[4])
+updated_at = sys.argv[5]
+
+data = json.load(sys.stdin)
+data[project] = {
+    "current_session": session_id,
+    "last_updated": updated_at,
+    "tracker": tracker,
+}
+
+if len(data) > max_sessions:
+    sorted_items = sorted(
         data.items(),
-        key=lambda x: x[1].get('last_updated', ''),
-        reverse=True
-      )
-      data = dict(sorted_items[:$MAX_SESSIONS_PER_PROJECT])
-    
-    json.dump(data, sys.stdout, indent=2)
-  "
-  
+        key=lambda item: item[1].get("last_updated", ""),
+        reverse=True,
+    )
+    data = dict(sorted_items[:max_sessions])
+
+json.dump(data, sys.stdout, indent=2)
+PY
+
   if [[ "$HAS_FLOCK" == true ]]; then
     (
       flock -x 200
-      python3 -c "$update_cmd" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
+      python3 -c "$update_cmd" "$project" "$session_id" "$tracker_data" "$MAX_SESSIONS_PER_PROJECT" "$(date -Iseconds)" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
         mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
     ) 200>"$SESSIONS_FILE.lock"
   else
-    python3 -c "$update_cmd" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
+    python3 -c "$update_cmd" "$project" "$session_id" "$tracker_data" "$MAX_SESSIONS_PER_PROJECT" "$(date -Iseconds)" < "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && \
       mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
   fi
 }
@@ -432,48 +600,56 @@ add_iteration_history() {
   local session_id="$2"
   local status="$3"
   local prompt="$4"
-  
-  local iteration_entry="{
-    \"session_id\": \"$session_id\",
-    \"timestamp\": \"$(date -Iseconds)\",
-    \"status\": \"$status\",
-    \"prompt\": $(echo "$prompt" | jq -R -s .)
-  }"
-  
-  local update_cmd="
-    import json, sys
-    data = json.load(sys.stdin)
-    if '$project' not in data:
-      data['$project'] = []
-    data['$project'].append($iteration_entry)
-    
-    # Keep only last 100 iterations per project
-    if len(data['$project']) > 100:
-      data['$project'] = data['$project'][-100:]
-    
-    # Also enforce total limit
-    total = sum(len(v) for v in data.values())
-    if total > $MAX_ITERATIONS:
-      # Remove oldest from each project proportionally
-      while total > $MAX_ITERATIONS:
-        for proj in list(data.keys()):
-          if data[proj]:
+
+  local update_cmd
+  read -r -d '' update_cmd <<'PY' || true
+import json
+import sys
+
+project = sys.argv[1]
+session_id = sys.argv[2]
+status = sys.argv[3]
+prompt = sys.argv[4]
+max_iterations = int(sys.argv[5])
+timestamp = sys.argv[6]
+
+data = json.load(sys.stdin)
+data.setdefault(project, []).append(
+    {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "status": status,
+        "prompt": prompt,
+    }
+)
+
+if len(data[project]) > 100:
+    data[project] = data[project][-100:]
+
+total = sum(len(value) for value in data.values())
+while total > max_iterations:
+    removed = False
+    for proj in list(data.keys()):
+        if data[proj]:
             data[proj].pop(0)
             total -= 1
-            if total <= $MAX_ITERATIONS:
-              break
-    
-    json.dump(data, sys.stdout, indent=2)
-  "
-  
+            removed = True
+            if total <= max_iterations:
+                break
+    if not removed:
+        break
+
+json.dump(data, sys.stdout, indent=2)
+PY
+
   if [[ "$HAS_FLOCK" == true ]]; then
     (
       flock -x 200
-      python3 -c "$update_cmd" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
+      python3 -c "$update_cmd" "$project" "$session_id" "$status" "$prompt" "$MAX_ITERATIONS" "$(date -Iseconds)" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
         mv "$ITERATIONS_FILE.tmp" "$ITERATIONS_FILE"
     ) 200>"$ITERATIONS_FILE.lock"
   else
-    python3 -c "$update_cmd" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
+    python3 -c "$update_cmd" "$project" "$session_id" "$status" "$prompt" "$MAX_ITERATIONS" "$(date -Iseconds)" < "$ITERATIONS_FILE" > "$ITERATIONS_FILE.tmp" && \
       mv "$ITERATIONS_FILE.tmp" "$ITERATIONS_FILE"
   fi
 }
@@ -492,7 +668,7 @@ log_skill_action() {
   fi
   
   local short_prompt
-  short_prompt=$(echo "$prompt" | cut -c1-80)
+  short_prompt=$(printf '%s' "$prompt" | cut -c1-80)
   if [[ ${#prompt} -gt 80 ]]; then
     short_prompt="${short_prompt}..."
   fi
@@ -512,12 +688,16 @@ SESSION_ID="$(date +%s)-$$-${RANDOM}"
 SESSION_TRACKER="$ZOID_DIR/session.json"
 cat > "$SESSION_TRACKER" << EOF
 {
+  "local_session_id": "$SESSION_ID",
   "session_id": "$SESSION_ID",
   "project": "$PROJECT",
   "agent": "$AGENT_NAME",
+  "task_id": $(if [[ -n "$TASK_ID" ]]; then printf '%s' "$TASK_ID" | jq -R -s .; else echo "null"; fi),
+  "branch": $(if [[ -n "$CURRENT_BRANCH" ]]; then printf '%s' "$CURRENT_BRANCH" | jq -R -s .; else echo "null"; fi),
   "started_at": "$(date -Iseconds)",
-  "prompt": $(echo "$PROMPT" | jq -R -s .),
+  "prompt": $(printf '%s' "$PROMPT" | jq -R -s .),
   "status": "running",
+  "launch_mode": "${CODEX_LAUNCH_MODE:-foreground}",
   "flags": {
     "approval_policy": "never",
     "sandbox": "workspace-write"
@@ -549,7 +729,8 @@ fi
 
 # Update session tracker with results
 jq --arg sid "$CODEX_SESSION_ID" --arg exit "$EXIT_CODE" '
-  .session_id = $sid |
+  .session_id = (if $sid == "" then .session_id else $sid end) |
+  .codex_session_id = (if $sid == "" then null else $sid end) |
   .exit_code = ($exit | tonumber) |
   .completed_at = "'$(date -Iseconds)'"
 ' "$SESSION_TRACKER" > "$SESSION_TRACKER.tmp" && mv "$SESSION_TRACKER.tmp" "$SESSION_TRACKER"
