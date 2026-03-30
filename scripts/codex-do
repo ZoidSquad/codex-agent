@@ -107,6 +107,29 @@ else
   HAS_CLAWD=true
 fi
 
+check_codex_sandbox_health() {
+  if [[ "${CODEX_SKIP_SANDBOX_PREFLIGHT:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+
+  local preflight_output
+  if preflight_output=$(codex sandbox linux /bin/true 2>&1); then
+    return 0
+  fi
+
+  echo "Error: Codex Linux sandbox preflight failed." >&2
+  echo "codex-do is configured for '-a never exec --sandbox workspace-write', but this host cannot start the sandbox." >&2
+  echo "Preflight command: codex sandbox linux /bin/true" >&2
+  echo "Failure: $preflight_output" >&2
+  echo "Common causes: VM/container/AppArmor restrictions blocking the required namespaces." >&2
+  echo "Fix host sandbox support or deliberately choose an unsandboxed Codex path outside codex-do." >&2
+  exit 1
+}
+
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
@@ -411,6 +434,7 @@ fi
 
 if [[ "$DRY_RUN" != true && "$SUGGEST_CMD" != true ]]; then
   ensure_no_existing_run
+  check_codex_sandbox_health
 fi
 
 MODE_LABEL="Unattended workspace-write sandbox"

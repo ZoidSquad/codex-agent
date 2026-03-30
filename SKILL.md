@@ -24,6 +24,7 @@ Automated Codex CLI wrapper with session tracking. All code lives in `/home/dan/
 - ✅ **Machine-readable status** - `codex-status --json` for reliable orchestration
 - ✅ **Duplicate-run guard** - Prevents overlapping Codex launches in the same repo by default
 - ✅ **Task-branch enforcement** - Tracked task work stays on a deterministic git branch per task
+- ✅ **Sandbox preflight** - Fails fast if the Codex Linux sandbox backend is unavailable
 - ✅ **Fixed exit codes** - Correctly reports Codex failure/success
 - ✅ **Fixed CLI path** - Uses `clawd` instead of old `~/clawd-team/` path
 - ✅ **Configurable timeout** - Use `--timeout 0` for no timeout
